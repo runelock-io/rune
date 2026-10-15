@@ -424,7 +424,7 @@ Rune's security design prioritizes simplicity and auditability over complexity.
 - [x] System tokens with sealed-state access
 - [ ] Audit logging with tamper-evident records
 - [ ] TLS support for remote deployments
-- [ ] Role-based access control (RBAC)
+- [x] Role-based access control (RBAC)
 - [ ] HashiCorp Vault import
 
 ---
