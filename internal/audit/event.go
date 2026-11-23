@@ -22,6 +22,10 @@ const (
 	TypeK8sMappingDelete = "k8s.mapping_delete"
 	TypeK8sSync          = "k8s.sync"
 
+	TypeUserCreate = "user.create"
+	TypeUserDelete = "user.delete"
+	TypeUserLogin  = "user.login"
+
 	StatusSuccess = "success"
 	StatusFailure = "failure"
 )

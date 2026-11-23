@@ -72,6 +72,13 @@ export interface TokenRecord {
   platform?: string
 }
 
+export interface UserAccount {
+  username: string
+  token_id: string
+  namespaces?: NamespacePermission[]
+  created_at: string
+}
+
 export const ALL_PERMS = ['read', 'write', 'delete', 'rotate'] as const
 export type Permission = typeof ALL_PERMS[number]
 
@@ -230,4 +237,26 @@ export const api = {
   deleteK8sMapping: (token: string, id: string) =>
     fetch('/k8s/mapping/delete', { method: 'POST', ...hdr(token), body: JSON.stringify({ id }) })
       .then(check),
+
+  userLogin: (username: string, password: string): Promise<{ token: string }> =>
+    fetch('/user/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    }).then(check).then(r => r.json()),
+
+  createUser: (token: string, username: string, password: string, namespaces: NamespacePermission[]) =>
+    fetch('/user/create', {
+      method: 'POST', ...hdr(token),
+      body: JSON.stringify({ username, password, namespaces }),
+    }).then(check),
+
+  listUsers: (token: string): Promise<UserAccount[]> =>
+    fetch('/user/list', hdr(token)).then(check).then(r => r.json()),
+
+  deleteUser: (token: string, username: string) =>
+    fetch('/user/delete', {
+      method: 'POST', ...hdr(token),
+      body: JSON.stringify({ username }),
+    }).then(check),
 }

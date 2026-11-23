@@ -13,12 +13,13 @@ interface Props {
 
 // ─── Event category config ────────────────────────────────────────────────────
 
-type Category = 'all' | 'secrets' | 'tokens' | 'namespaces' | 'vault' | 'k8s'
+type Category = 'all' | 'secrets' | 'tokens' | 'namespaces' | 'vault' | 'k8s' | 'users'
 
 const CATEGORIES: { id: Category; label: string }[] = [
   { id: 'all',        label: 'All' },
   { id: 'secrets',    label: 'Secrets' },
   { id: 'tokens',     label: 'Tokens' },
+  { id: 'users',      label: 'Users' },
   { id: 'namespaces', label: 'Namespaces' },
   { id: 'vault',      label: 'Vault' },
   { id: 'k8s',        label: 'Kubernetes' },
@@ -41,6 +42,9 @@ const TYPE_CATEGORY: Record<string, Category> = {
   'k8s.mapping_create':  'k8s',
   'k8s.mapping_delete':  'k8s',
   'k8s.sync':            'k8s',
+  'user.create':         'users',
+  'user.delete':         'users',
+  'user.login':          'users',
 }
 
 const TYPE_LABEL: Record<string, string> = {
@@ -60,6 +64,9 @@ const TYPE_LABEL: Record<string, string> = {
   'k8s.mapping_create':  'Create mapping',
   'k8s.mapping_delete':  'Delete mapping',
   'k8s.sync':            'Operator sync',
+  'user.create':         'Create user',
+  'user.delete':         'Delete user',
+  'user.login':          'User login',
 }
 
 // Colour by action intent, not category
@@ -85,6 +92,10 @@ const TYPE_CHIP: Record<string, string> = {
   'secret.ttl_set':      'bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-800',
   // Sync — indigo
   'k8s.sync':            'bg-indigo-100 text-indigo-800 border-indigo-200 dark:bg-indigo-950 dark:text-indigo-300 dark:border-indigo-800',
+  // User — emerald create, rose delete, sky login
+  'user.create':         'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-950 dark:text-emerald-300 dark:border-emerald-800',
+  'user.delete':         'bg-rose-100 text-rose-800 border-rose-200 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-800',
+  'user.login':          'bg-sky-100 text-sky-800 border-sky-200 dark:bg-sky-950 dark:text-sky-300 dark:border-sky-800',
 }
 
 // ─── Relative time helper ─────────────────────────────────────────────────────

@@ -127,19 +127,36 @@ func Start() {
 	store.CreateNamespace(constants.DefaultNamespace)
 
 	sealer := seal.NewManger()
+
+	if pass := os.Getenv("RUNE_UNSEAL_PASSPHRASE"); pass != "" {
+		key := crypto.DeriveKey(pass, salt)
+		record, err := store.Get(storage.VerifyKey)
+		if err == nil {
+			if _, err := crypto.Decrypt(key, record.Ciphertext, record.Nonce); err == nil {
+				sealer.Unseal(key)
+				log.Println("vault auto-unsealed via RUNE_UNSEAL_PASSPHRASE")
+			} else {
+				log.Println("WARNING: RUNE_UNSEAL_PASSPHRASE is set but passphrase is wrong — vault remains sealed")
+			}
+		}
+	}
+
 	secretService := service.NewSecretService(store, sealer)
 	tokenService := service.NewTokenService(store, sealer)
 	namespaceService := service.NewNamespaceService(store)
 	k8sService := service.NewK8sMappingService(store)
+	userService := service.NewUserService(store)
 	auditLogger := audit.NewLogger(store)
 	handler := api.NewHandler(secretService, tokenService, namespaceService, store, sealer, auditLogger)
 	k8sHandler := api.NewK8sHandler(k8sService, auditLogger)
+	userHandler := api.NewUserHandler(userService, auditLogger)
 	auditHandler := api.NewAuditHandler(store)
 
 	// PUBLIC
 	public := http.NewServeMux()
 	public.HandleFunc("/unseal", handler.Unseal)
 	public.HandleFunc("/status", handler.Status)
+	public.HandleFunc("/user/login", userHandler.Login)
 	public.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -171,6 +188,9 @@ func Start() {
 	protected.HandleFunc("/k8s/mapping/delete", k8sHandler.DeleteMapping)
 	protected.HandleFunc("/k8s/mapping/status", k8sHandler.UpdateStatus)
 	protected.HandleFunc("/audit/events", auditHandler.ListEvents)
+	protected.HandleFunc("/user/create", userHandler.Create)
+	protected.HandleFunc("/user/list", userHandler.List)
+	protected.HandleFunc("/user/delete", userHandler.Delete)
 
 	// APPLY MIDDLEWARE
 	secured := middleware.AuthMiddleware(store)(protected)
@@ -179,6 +199,7 @@ func Start() {
 	finalMux.Handle("/unseal", public)
 	finalMux.Handle("/status", public)
 	finalMux.Handle("/health", public)
+	finalMux.Handle("/user/login", public)
 	finalMux.Handle("/ui/", http.StripPrefix("/ui", ui.Handler()))
 	finalMux.Handle("/", secured)
 

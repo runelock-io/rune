@@ -48,6 +48,11 @@ type Store interface {
 	ListSecretsWithMeta(namespace string) ([]SecretMeta, error)
 	ListExpiredSecrets() ([]string, error)
 	SetSecretTTL(fullKey, ttl, expiresAt string) error
+
+	SaveUser(record UserRecord) error
+	GetUser(username string) (UserRecord, error)
+	ListUsers() ([]UserRecord, error)
+	DeleteUser(username string) error
 }
 
 type NamespaceCount struct {
@@ -95,6 +100,15 @@ type SecretMeta struct {
 	RotatedAt string `json:"rotated_at,omitempty"`
 	TTL       string `json:"ttl,omitempty"`
 	ExpiresAt string `json:"expires_at,omitempty"`
+}
+
+type UserRecord struct {
+	Username     string                 `json:"username"`
+	PasswordHash string                 `json:"password_hash"`
+	TokenID      string                 `json:"token_id"`
+	Token        string                 `json:"token"`
+	Namespaces   []auth.NamespacePermission `json:"namespaces,omitempty"`
+	CreatedAt    string                 `json:"created_at"`
 }
 
 var _ Store = (*BoltStore)(nil)
