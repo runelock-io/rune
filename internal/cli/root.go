@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"rune/internal/config"
 	"rune/internal/constants"
 
 	"github.com/spf13/cobra"
@@ -105,7 +106,10 @@ func init() {
 }
 
 func serverURL() string {
-	return "http://localhost:" + constants.DefaultPort
+	if env := os.Getenv("RUNE_SERVER"); env != "" {
+		return env
+	}
+	return config.GetServerURL(constants.DefaultPort)
 }
 
 func Execute() {

@@ -25,6 +25,7 @@
 - [Architecture](#architecture)
 - [Installation](#installation)
 - [Getting Started](#getting-started)
+- [Deploying on AWS EC2](#deploying-on-aws-ec2)
 - [CLI Reference](#cli-reference)
 - [API Reference](#api-reference)
 - [Data Storage](#data-storage)
@@ -199,6 +200,166 @@ rune seal
 
 ---
 
+## Deploying on AWS EC2
+
+This section covers running `rune-server` on an EC2 instance so you can access your vault from a browser or the CLI from any machine.
+
+### Step 1 — Launch an EC2 instance
+
+Any instance type works. Amazon Linux 2023 or Ubuntu 22.04 are both fine. During or after launch, configure the **Security Group** to allow inbound traffic on port `2710`:
+
+| Type | Protocol | Port | Source |
+|------|----------|------|--------|
+| Custom TCP | TCP | 2710 | Your IP (`x.x.x.x/32`) |
+| SSH | TCP | 22 | Your IP (`x.x.x.x/32`) |
+
+> Restrict port 2710 to your own IP — do not open it to `0.0.0.0/0` unless you have a firewall or reverse proxy in front. Rune currently serves plain HTTP.
+
+---
+
+### Step 2 — Install Rune on the instance
+
+SSH into your instance and run the installer:
+
+```bash
+ssh -i your-key.pem ec2-user@<ec2-public-ip>
+
+curl -fsSL https://raw.githubusercontent.com/runelock-io/rune/main/scripts/install.sh | bash
+```
+
+Verify the install:
+
+```bash
+rune-server --version
+```
+
+---
+
+### Step 3 — Run the server
+
+Start `rune-server` for the first time. It will prompt for a passphrase and print your root token:
+
+```bash
+rune-server
+```
+
+```
+Set a passphrase: ••••••••••••••
+
+  ────────────────────────────────────────────────────
+  root token
+  ────────────────────────────────────────────────────
+
+  rnk_92776b83307767ff9d7be381ffae323a07131f98b34e1842fb7f3206771c7b51
+
+  ────────────────────────────────────────────────────
+  shown once  ·  not stored  ·  full vault access
+  ────────────────────────────────────────────────────
+```
+
+> **Save your root token and passphrase immediately.** Neither can be recovered.
+
+The server binds to `0.0.0.0:2710` — it is now reachable at `http://<ec2-public-ip>:2710`.
+
+---
+
+### Step 4 — Run as a background service (systemd)
+
+To keep the server running after you disconnect, create a systemd unit:
+
+```bash
+sudo tee /etc/systemd/system/rune.service > /dev/null <<EOF
+[Unit]
+Description=Rune Secrets Vault
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/rune-server
+Restart=on-failure
+RestartSec=5
+User=ec2-user
+WorkingDirectory=/home/ec2-user
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable rune
+sudo systemctl start rune
+```
+
+Check it is running:
+
+```bash
+sudo systemctl status rune
+```
+
+> On first start the service needs terminal input for the passphrase prompt. Run `rune-server` manually once to complete the initial setup, then start the service. On subsequent starts the passphrase is entered via `rune unseal` after the service is up.
+
+---
+
+### Step 5 — Unseal after a restart
+
+The vault starts **sealed** every time the process launches. After the service starts (or the instance reboots), unseal it remotely from your local machine:
+
+```bash
+rune --server http://<ec2-public-ip>:2710 unseal
+```
+
+Or set the env var so you don't have to repeat the flag:
+
+```bash
+export RUNE_SERVER=http://<ec2-public-ip>:2710
+rune unseal
+```
+
+---
+
+### Step 6 — Connect the CLI from your local machine
+
+Log in once to save the server URL and token together:
+
+```bash
+rune login --server http://<ec2-public-ip>:2710 rnk_92776b83...
+```
+
+All subsequent CLI commands now target the EC2 instance automatically — no flags needed:
+
+```bash
+rune put DATABASE_URL postgres://...
+rune list
+rune get DATABASE_URL
+```
+
+---
+
+### Step 7 — Open the Web UI
+
+Navigate to:
+
+```
+http://<ec2-public-ip>:2710/ui/
+```
+
+Enter your root token to log in.
+
+---
+
+### Production hardening checklist
+
+| | Recommendation |
+|---|---|
+| **TLS** | Put Rune behind Nginx or Caddy with a TLS certificate (Let's Encrypt). Rune itself serves plain HTTP — TLS termination at the reverse proxy is the standard pattern. |
+| **Firewall** | Restrict port 2710 in the Security Group to known IPs. If using a reverse proxy on port 443, close 2710 to the public entirely. |
+| **Persistence** | The database lives at `~/.rune/rune.db`. Back it up to S3 with a cron job or AWS Backup. |
+| **IAM** | Do not run `rune-server` as root. Use a dedicated system user with no other privileges. |
+| **Unseal automation** | For fully automated restarts, unseal via `rune unseal` from a startup script. Keep the passphrase in AWS Secrets Manager or SSM Parameter Store — not on the instance itself. |
+
+---
+
 ## CLI Reference
 
 ```
@@ -216,6 +377,7 @@ COMMANDS:
   delete <key>                    Delete a secret (use -n <namespace> for a namespace)
   rotate <key>                    Rotate a secret and preserve the old version
   history <key>                   Show all versions of a secret
+  set-ttl <key> [ttl]             Set auto-rotation TTL on a secret (e.g. 7d, 24h, 30s)
   namespace create <name>         Create a new namespace
   namespace list                  List all namespaces
   namespace delete <name>         Delete a namespace
@@ -226,8 +388,13 @@ COMMANDS:
 
 OPTIONS:
   -n, --namespace <name>          Target namespace for secret operations
+  -s, --server <url>              Rune server URL — used with login to point at a remote server
+  -t, --ttl <duration>            Auto-rotation TTL — used with put (e.g. 7d, 24h, 30s)
   --help                          Show help for any command
   --version                       Print the current version
+
+ENVIRONMENT:
+  RUNE_SERVER                     Override the server URL for all commands (e.g. http://1.2.3.4:2710)
 ```
 
 ### Examples
