@@ -5,10 +5,10 @@ import (
 )
 
 var (
-	success = color.New(color.FgGreen).SprintFunc()
-	error   = color.New(color.FgRed).SprintFunc()
-	info    = color.New(color.FgCyan).SprintFunc()
-	warn    = color.New(color.FgYellow).SprintFunc()
+	success  = color.New(color.FgGreen).SprintFunc()
+	errStyle = color.New(color.FgRed).SprintFunc()
+	info     = color.New(color.FgCyan).SprintFunc()
+	warn     = color.New(color.FgYellow).SprintFunc()
 )
 
 func Success(msg string) {
@@ -16,7 +16,7 @@ func Success(msg string) {
 }
 
 func Error(msg string) {
-	println(error("✖ " + msg))
+	println(errStyle("✖ " + msg))
 }
 
 func Info(msg string) {

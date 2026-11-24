@@ -91,6 +91,7 @@ func printBanner() {
 	printRow("namespace", "manage namespaces")
 	printRow("login", "authenticate with the rune server")
 	printRow("token", "manage authentication tokens")
+	printRow("update", "update the CLI to the latest release")
 	fmt.Println()
 
 	fmt.Println(c(dim, "  rune <command> --help   details on a command"))
