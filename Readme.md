@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v1.0.0--RC-blue" alt="version"/>
+  <img src="https://img.shields.io/badge/version-v1.0.1--RC-blue" alt="version"/>
   <img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="license"/>
   <img src="https://img.shields.io/badge/go-%3E%3D1.21-00ADD8?logo=go" alt="go version"/>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue" alt="platform"/>
@@ -21,10 +21,14 @@
 ## Table of Contents
 
 - [Overview](#overview)
+- [What's New in v1.0.1-RC](#whats-new-in-v101-rc)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Installation](#installation)
+- [Updating Rune](#updating-rune)
 - [Getting Started](#getting-started)
+- [Multi-Developer Auth](#multi-developer-auth)
+- [Kubernetes Operator](#kubernetes-operator)
 - [Deploying on AWS EC2](#deploying-on-aws-ec2)
 - [CLI Reference](#cli-reference)
 - [API Reference](#api-reference)
@@ -34,6 +38,25 @@
 - [Contributing](#contributing)
 - [Philosophy](#philosophy)
 - [License](#license)
+
+---
+
+## What's New in v1.0.1-RC
+
+### Multi-Developer Auth
+Rune can now be shared across a team without exposing the master passphrase. Admins create username + password accounts for developers via the new **Users** view. Each user gets their own session token scoped to specific namespaces and permissions. Developers log in with familiar credentials instead of pasting a 64-character hex token.
+
+### Auto-Unseal
+Set `RUNE_UNSEAL_PASSPHRASE` in your deployment environment and the vault unseals itself automatically on every restart. Developers never see the passphrase screen.
+
+### Kubernetes Operator
+Rune now ships a Kubernetes operator (`rune-operator`) that syncs secrets from Rune namespaces directly into Kubernetes Secrets. Create a mapping in the UI or via API — the operator watches for changes and keeps your cluster in sync.
+
+### TTL-Based Auto-Rotation
+Secrets can now have a TTL (`30s`, `1h`, `7d`, `90d`, etc.). When a secret expires, the vault's background scheduler rotates it automatically and logs the event in the audit log. Set TTLs from the CLI with `rune put --ttl` or `rune set-ttl`, or from the UI.
+
+### `rune update`
+The CLI can now update itself in-place. Run `rune update` and it will check for the latest release on GitHub, download the right binary for your platform, and replace itself atomically.
 
 ---
 
@@ -64,6 +87,11 @@ It provides AES-256-GCM encrypted storage, a secure seal/unseal lifecycle, names
 | **JSON / .env Import** | Bulk-import secrets from a `.json` or `.env` file directly into any namespace |
 | **CLI Interface** | Full-featured command-line tool for all vault operations |
 | **Zero External Dependencies** | No cloud services, no agents, no sidecars — just a single binary |
+| **TTL-Based Auto-Rotation** | Set a TTL on any secret (`30s` min); the scheduler rotates it automatically when it expires |
+| **Multi-Developer Auth** | Username + password accounts backed by scoped session tokens — no passphrase sharing |
+| **Auto-Unseal** | Set `RUNE_UNSEAL_PASSPHRASE` to unseal the vault automatically on startup |
+| **Audit Log** | Tamper-resistant log of every read, write, rotate, login, and admin action |
+| **Kubernetes Operator** | Sync Rune secrets into Kubernetes Secrets automatically via the `rune-operator` |
 | **BoltDB Storage** | Embedded key-value store — the same underlying engine powering etcd |
 
 ---
@@ -106,6 +134,66 @@ rune-server --version
 ```
 
 > Binary releases for other platforms are available on the [Releases](https://github.com/runelock-io/rune/releases) page.
+
+---
+
+## Updating Rune
+
+### CLI — one command
+
+If you have `rune` v1.0.1-RC or later installed:
+
+```bash
+rune update
+```
+
+It checks GitHub for the latest release, downloads the right binary for your platform, and replaces itself in-place.
+
+```
+Current version: v1.0.1-RC
+Checking for updates... done
+New version available: v1.0.2
+Downloading rune_darwin_arm64... done
+✔ Updated to v1.0.2 — restart your shell if needed
+```
+
+### CLI — manual (older installs)
+
+If you're on a version before `rune update` was added, download the new binary manually:
+
+```bash
+# macOS (Apple Silicon)
+curl -L https://github.com/runelock-io/rune/releases/latest/download/rune_darwin_arm64 -o rune
+chmod +x rune && sudo mv rune /usr/local/bin/rune
+
+# macOS (Intel)
+curl -L https://github.com/runelock-io/rune/releases/latest/download/rune_darwin_amd64 -o rune
+chmod +x rune && sudo mv rune /usr/local/bin/rune
+
+# Linux (amd64)
+curl -L https://github.com/runelock-io/rune/releases/latest/download/rune_linux_amd64 -o rune
+chmod +x rune && sudo mv rune /usr/local/bin/rune
+
+# Linux (arm64)
+curl -L https://github.com/runelock-io/rune/releases/latest/download/rune_linux_arm64 -o rune
+chmod +x rune && sudo mv rune /usr/local/bin/rune
+```
+
+### Server — manual update
+
+```bash
+# Stop the server
+sudo systemctl stop rune
+
+# Download the new server binary (example: Linux amd64)
+curl -L https://github.com/runelock-io/rune/releases/latest/download/rune-server_linux_amd64 -o rune-server
+chmod +x rune-server && sudo mv rune-server /usr/local/bin/rune-server
+
+# Restart
+sudo systemctl start rune
+```
+
+> The database (`~/.rune/rune.db`) is never touched during an update. All secrets, tokens, namespaces, and audit events are preserved.
 
 ---
 
@@ -200,6 +288,129 @@ rune seal
 
 ---
 
+## Multi-Developer Auth
+
+Rune supports shared deployments where multiple developers each have their own account — without anyone seeing the master passphrase.
+
+### How it works
+
+1. **Admin** deploys Rune and sets `RUNE_UNSEAL_PASSPHRASE` in the server environment (systemd, docker-compose, etc.)
+2. **Admin** creates user accounts in the **Users** view (root-only), assigning each user a username, password, and namespace permissions
+3. **Developer** opens the Rune UI → logs in with username + password
+4. The server returns a scoped session token — the developer never touches the raw token
+
+Each user account has its own session token with the exact namespace permissions the admin configured. Revoking a user immediately invalidates their session.
+
+### Auto-unseal
+
+Add `RUNE_UNSEAL_PASSPHRASE` to your server environment so the vault unseals itself on every restart:
+
+```bash
+# systemd unit
+[Service]
+ExecStart=/usr/local/bin/rune-server
+Environment=RUNE_UNSEAL_PASSPHRASE=your-passphrase
+```
+
+```bash
+# Docker
+docker run -e RUNE_UNSEAL_PASSPHRASE=your-passphrase runelock/rune-server
+```
+
+If the env var is set but the passphrase is wrong, the server logs a warning and starts sealed — it never silently fails.
+
+### Creating a user (API)
+
+```bash
+curl -X POST http://localhost:2710/user/create \
+  -H "Authorization: Bearer <root-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "alice",
+    "password": "correct-horse-battery",
+    "namespaces": [
+      {"namespace": "production", "permissions": ["read"]},
+      {"namespace": "staging",    "permissions": ["read", "write", "rotate"]}
+    ]
+  }'
+```
+
+### Developer login (API)
+
+```bash
+curl -X POST http://localhost:2710/user/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "alice", "password": "correct-horse-battery"}'
+
+# → {"token": "rnk_..."}
+```
+
+The returned token flows through the existing auth middleware — the developer can then use it with the CLI or any SDK.
+
+---
+
+## Kubernetes Operator
+
+The `rune-operator` syncs secrets from a Rune namespace into native Kubernetes Secrets automatically. Configure a mapping once — the operator watches for changes and keeps your cluster in sync.
+
+### How it works
+
+1. Run `rune-operator` in your cluster (it connects to your Rune server over HTTP)
+2. Create a **mapping** in the Rune UI (**Kubernetes** view) or via API
+3. The operator reads the specified keys from the Rune namespace and writes them into a Kubernetes Secret in the target namespace
+4. On each sync cycle (configurable interval), it re-reads from Rune and updates the K8s Secret if anything changed
+
+### Creating a mapping (API)
+
+```bash
+curl -X POST http://localhost:2710/k8s/mapping/create \
+  -H "Authorization: Bearer <root-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":              "prod-db-creds",
+    "rune_namespace":    "production",
+    "keys":              ["db/password", "db/host", "api/key"],
+    "target_secret":     "prod-secrets",
+    "target_k8s_ns":     "default",
+    "secret_type":       "Opaque",
+    "refresh_interval":  "5m"
+  }'
+```
+
+| Field | Description |
+|---|---|
+| `name` | Human-readable name for the mapping |
+| `rune_namespace` | The Rune namespace to read secrets from |
+| `keys` | List of secret keys to sync (e.g. `db/password`) |
+| `target_secret` | Name of the Kubernetes Secret to create/update |
+| `target_k8s_ns` | Kubernetes namespace where the Secret lives |
+| `secret_type` | Kubernetes Secret type — `Opaque`, `kubernetes.io/tls`, etc. |
+| `refresh_interval` | How often the operator re-syncs (e.g. `1m`, `5m`, `1h`) |
+
+### Checking sync status
+
+```bash
+curl http://localhost:2710/k8s/mapping/status \
+  -H "Authorization: Bearer <root-token>"
+
+# → {"mapping_id": "...", "last_sync": "...", "status": "synced", "secret_count": 3}
+```
+
+Sync status is also visible in the **Kubernetes** view in the web UI, showing `synced`, `pending`, or `error` per mapping.
+
+### Running the operator
+
+```bash
+# Point it at your Rune server
+RUNE_SERVER=http://localhost:2710 \
+RUNE_TOKEN=<root-or-system-token> \
+./rune-operator
+```
+
+For production, run it as a Kubernetes Deployment with the token stored in a Kubernetes Secret.
+
+---
+
 ## Deploying on AWS EC2
 
 This section covers running `rune-server` on an EC2 instance so you can access your vault from a browser or the CLI from any machine.
@@ -281,6 +492,8 @@ User=ec2-user
 WorkingDirectory=/home/ec2-user
 StandardOutput=journal
 StandardError=journal
+# Optional: auto-unseal on startup so developers never see the passphrase screen
+# Environment=RUNE_UNSEAL_PASSPHRASE=your-passphrase
 
 [Install]
 WantedBy=multi-user.target
@@ -356,7 +569,7 @@ Enter your root token to log in.
 | **Firewall** | Restrict port 2710 in the Security Group to known IPs. If using a reverse proxy on port 443, close 2710 to the public entirely. |
 | **Persistence** | The database lives at `~/.rune/rune.db`. Back it up to S3 with a cron job or AWS Backup. |
 | **IAM** | Do not run `rune-server` as root. Use a dedicated system user with no other privileges. |
-| **Unseal automation** | For fully automated restarts, unseal via `rune unseal` from a startup script. Keep the passphrase in AWS Secrets Manager or SSM Parameter Store — not on the instance itself. |
+| **Unseal automation** | Set `RUNE_UNSEAL_PASSPHRASE` in the systemd unit. Store the passphrase value in AWS SSM Parameter Store and inject it at deploy time — never hardcode it in the unit file on disk. |
 
 ---
 
@@ -366,18 +579,21 @@ Enter your root token to log in.
 USAGE:
   rune <command> [arguments]
 
-COMMANDS:
-  login <token>                   Authenticate with the vault and store token locally
-  unseal                          Unseal the vault using your passphrase
-  seal                            Seal the vault, making all secrets inaccessible
-  status                          Display the current seal status of the vault
-  put <key> <value>               Store a secret (use -n <namespace> to target a namespace)
-  get <key>                       Retrieve a secret (use -n <namespace> for a namespace)
-  list                            List all secrets (use -n <namespace> for a namespace)
-  delete <key>                    Delete a secret (use -n <namespace> for a namespace)
+VAULT
+  put <key> <value>               Store a secret (use -n for namespace, -t for TTL)
+  get <key>                       Retrieve a secret
+  list                            List all secrets
+  delete <key>                    Delete a secret
   rotate <key>                    Rotate a secret and preserve the old version
   history <key>                   Show all versions of a secret
   set-ttl <key> [ttl]             Set auto-rotation TTL on a secret (e.g. 7d, 24h, 30s)
+
+ACCESS
+  unseal                          Unseal the vault using your passphrase
+  seal                            Seal the vault, making all secrets inaccessible
+  status                          Display the current seal status of the vault
+
+ORG
   namespace create <name>         Create a new namespace
   namespace list                  List all namespaces
   namespace delete <name>         Delete a namespace
@@ -385,6 +601,8 @@ COMMANDS:
   token list                      List all tokens
   token revoke <id>               Revoke a token by ID
   token create-system <name>      Create a system token (read-only, sealed-access capable)
+  login <token>                   Authenticate with the vault and store token locally
+  update                          Update the CLI to the latest release
 
 OPTIONS:
   -n, --namespace <name>          Target namespace for secret operations
@@ -395,6 +613,7 @@ OPTIONS:
 
 ENVIRONMENT:
   RUNE_SERVER                     Override the server URL for all commands (e.g. http://1.2.3.4:2710)
+  RUNE_UNSEAL_PASSPHRASE          Auto-unseal the vault on server startup (server-side env var)
 ```
 
 ### Examples
@@ -455,6 +674,7 @@ Authorization: Bearer <your-token>
 | `GET` | `/status` | Vault seal status |
 | `POST` | `/unseal` | Unseal the vault |
 | `GET` | `/health` | Health check |
+| `POST` | `/user/login` | Log in with username + password, returns session token |
 
 ### Secrets
 
@@ -464,10 +684,12 @@ Authorization: Bearer <your-token>
 | `GET` | `/secret/get` | Retrieve the latest value of a secret |
 | `POST` | `/secret/delete` | Delete a secret |
 | `GET` | `/secret/list` | List secrets in a namespace |
+| `GET` | `/secret/meta` | List secrets with metadata (version, TTL, expiry) |
 | `GET` | `/secret/all` | Retrieve all secrets (key + value) in a namespace |
 | `POST` | `/secret/rotate` | Rotate a secret and preserve the old version |
 | `GET` | `/secret/history` | List all versions of a secret |
 | `GET` | `/secret/version` | Retrieve a specific version of a secret |
+| `POST` | `/secret/ttl` | Set or clear the auto-rotation TTL on a secret |
 
 ### Namespaces
 
@@ -486,6 +708,29 @@ Authorization: Bearer <your-token>
 | `POST` | `/token/create-system` | Create a read-only system token |
 | `POST` | `/token/revoke` | Revoke a token |
 | `GET` | `/token/list` | List all tokens (root only) |
+
+### Users
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/user/create` | Create a user account with namespace access (root only) |
+| `GET` | `/user/list` | List all user accounts (root only) |
+| `POST` | `/user/delete` | Delete a user account and revoke their token (root only) |
+
+### Kubernetes
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/k8s/mapping/create` | Create a Rune → Kubernetes Secret mapping |
+| `GET` | `/k8s/mappings` | List all mappings with sync status |
+| `POST` | `/k8s/mapping/delete` | Delete a mapping |
+| `POST` | `/k8s/mapping/status` | Update the sync status of a mapping (operator use) |
+
+### Audit
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/audit/events` | List audit events (root only, `?limit=N`) |
 
 ### Vault
 
@@ -589,10 +834,17 @@ Rune's security design prioritizes simplicity and auditability over complexity.
 - [x] JSON / .env bulk import
 - [x] Permission-based token access control
 - [x] System tokens with sealed-state access
-- [ ] Audit logging with tamper-evident records
-- [ ] TLS support for remote deployments
+- [x] Audit logging
 - [x] Role-based access control (RBAC)
+- [x] TTL-based auto-rotation
+- [x] Kubernetes Operator (sync to K8s Secrets)
+- [x] Multi-developer auth (username + password accounts)
+- [x] Auto-unseal via environment variable
+- [x] CLI self-update (`rune update`)
+- [ ] TLS support built-in (currently via reverse proxy)
 - [ ] HashiCorp Vault import
+- [ ] Brute-force protection on login/unseal endpoints
+- [ ] CLI self-update for `rune-server`
 
 ---
 
