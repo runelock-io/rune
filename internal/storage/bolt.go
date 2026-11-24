@@ -8,8 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"rune/internal/audit"
 	"rune/internal/auth"
 	"rune/internal/constants"
+	"rune/internal/k8s"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -17,6 +19,11 @@ import (
 const bucketName = "secrets"
 const tokenBucket = "__rune_tokens"
 const sysBucket = "__rune_sys_secrets"
+const k8sMappingBucket = "__rune_k8s_mappings"
+const k8sStatusBucket = "__rune_k8s_status"
+const auditBucket = "__rune_audit_log"
+const userBucket = "__rune_users"
+const auditMaxEvents = 10000
 
 type BoltStore struct {
 	db *bolt.DB
@@ -38,6 +45,22 @@ func NewBoltStore(path string) (*BoltStore, error) {
 			return err
 		}
 		_, err = tx.CreateBucketIfNotExists([]byte(sysBucket))
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateBucketIfNotExists([]byte(k8sMappingBucket))
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateBucketIfNotExists([]byte(k8sStatusBucket))
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateBucketIfNotExists([]byte(auditBucket))
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateBucketIfNotExists([]byte(userBucket))
 		return err
 	})
 
@@ -366,6 +389,83 @@ func (b *BoltStore) DeleteNamespace(namespace string) error {
 	})
 }
 
+// K8S MAPPINGS
+
+func (b *BoltStore) SaveK8sMapping(m k8s.Mapping) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(k8sMappingBucket))
+		data, err := json.Marshal(m)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(m.ID), data)
+	})
+}
+
+func (b *BoltStore) GetK8sMapping(id string) (k8s.Mapping, error) {
+	var m k8s.Mapping
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(k8sMappingBucket))
+		data := bucket.Get([]byte(id))
+		if data == nil {
+			return errors.New("[NOT FOUND] K8s mapping not found")
+		}
+		return json.Unmarshal(data, &m)
+	})
+	return m, err
+}
+
+func (b *BoltStore) DeleteK8sMapping(id string) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(k8sMappingBucket))
+		statusBucket := tx.Bucket([]byte(k8sStatusBucket))
+		statusBucket.Delete([]byte(id))
+		return bucket.Delete([]byte(id))
+	})
+}
+
+func (b *BoltStore) ListK8sMappings() ([]k8s.Mapping, error) {
+	var list []k8s.Mapping
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(k8sMappingBucket))
+		return bucket.ForEach(func(_, v []byte) error {
+			var m k8s.Mapping
+			if err := json.Unmarshal(v, &m); err == nil {
+				list = append(list, m)
+			}
+			return nil
+		})
+	})
+	return list, err
+}
+
+func (b *BoltStore) SaveK8sSyncStatus(s k8s.SyncStatus) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(k8sStatusBucket))
+		data, err := json.Marshal(s)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(s.MappingID), data)
+	})
+}
+
+func (b *BoltStore) GetK8sSyncStatus(mappingID string) (*k8s.SyncStatus, error) {
+	var s k8s.SyncStatus
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(k8sStatusBucket))
+		data := bucket.Get([]byte(mappingID))
+		if data == nil {
+			return errors.New("not found")
+		}
+		return json.Unmarshal(data, &s)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 func sysSecretKey(tokenID, namespace, key string) string {
 	return tokenID + "/" + namespace + "/" + key
 }
@@ -454,4 +554,192 @@ func (b *BoltStore) ListSystemTokensForNamespace(namespace string) ([]auth.Token
 		})
 	})
 	return result, err
+}
+
+func (b *BoltStore) AppendAuditEvent(e audit.Event) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(auditBucket))
+		data, err := json.Marshal(e)
+		if err != nil {
+			return err
+		}
+		if err := bucket.Put([]byte(e.ID), data); err != nil {
+			return err
+		}
+		// Trim oldest entries when over the cap
+		if bucket.Stats().KeyN > auditMaxEvents {
+			c := bucket.Cursor()
+			for k, _ := c.First(); k != nil && bucket.Stats().KeyN > auditMaxEvents; k, _ = c.First() {
+				if err := bucket.Delete(k); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func (b *BoltStore) ListAuditEvents(limit int) ([]audit.Event, error) {
+	var events []audit.Event
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(auditBucket))
+		if bucket == nil {
+			return nil
+		}
+		c := bucket.Cursor()
+		for k, v := c.Last(); k != nil && len(events) < limit; k, v = c.Prev() {
+			var e audit.Event
+			if err := json.Unmarshal(v, &e); err != nil {
+				continue
+			}
+			events = append(events, e)
+		}
+		return nil
+	})
+	return events, err
+}
+
+func (b *BoltStore) SetSecretTTL(fullKey, ttl, expiresAt string) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(bucketName))
+		data := bucket.Get([]byte(fullKey))
+		if data == nil {
+			return errors.New("[NOT FOUND] Secret not found")
+		}
+		var record SecretRecord
+		if err := json.Unmarshal(data, &record); err != nil {
+			return err
+		}
+		record.TTL = ttl
+		record.ExpiresAt = expiresAt
+		updated, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(fullKey), updated)
+	})
+}
+
+func (b *BoltStore) ListSecretsWithMeta(namespace string) ([]SecretMeta, error) {
+	prefix := namespace + "/"
+	var metas []SecretMeta
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(bucketName))
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(k, v []byte) error {
+			key := string(k)
+			if !strings.HasPrefix(key, prefix) {
+				return nil
+			}
+			if IsVersionedSecretKey(key) {
+				return nil
+			}
+			shortKey := strings.TrimPrefix(key, prefix)
+			if shortKey == "" {
+				return nil
+			}
+			var record SecretRecord
+			if err := json.Unmarshal(v, &record); err != nil {
+				return nil
+			}
+			metas = append(metas, SecretMeta{
+				Key:       shortKey,
+				Version:   record.Version,
+				CreatedAt: record.CreatedAt,
+				UpdatedAt: record.UpdatedAt,
+				RotatedAt: record.RotatedAt,
+				TTL:       record.TTL,
+				ExpiresAt: record.ExpiresAt,
+			})
+			return nil
+		})
+	})
+	return metas, err
+}
+
+func (b *BoltStore) SaveUser(record UserRecord) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(userBucket))
+		data, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(record.Username), data)
+	})
+}
+
+func (b *BoltStore) GetUser(username string) (UserRecord, error) {
+	var record UserRecord
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(userBucket))
+		data := bucket.Get([]byte(username))
+		if data == nil {
+			return errors.New("[NOT FOUND] User not found")
+		}
+		return json.Unmarshal(data, &record)
+	})
+	return record, err
+}
+
+func (b *BoltStore) ListUsers() ([]UserRecord, error) {
+	var users []UserRecord
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(userBucket))
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(_, v []byte) error {
+			var rec UserRecord
+			if err := json.Unmarshal(v, &rec); err == nil {
+				users = append(users, rec)
+			}
+			return nil
+		})
+	})
+	return users, err
+}
+
+func (b *BoltStore) DeleteUser(username string) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(userBucket))
+		if bucket.Get([]byte(username)) == nil {
+			return errors.New("[NOT FOUND] User not found")
+		}
+		return bucket.Delete([]byte(username))
+	})
+}
+
+func (b *BoltStore) ListExpiredSecrets() ([]string, error) {
+	now := time.Now()
+	var expired []string
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(bucketName))
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(k, v []byte) error {
+			key := string(k)
+			if key == VerifyKey || key == "__rune_salt" {
+				return nil
+			}
+			if IsVersionedSecretKey(key) {
+				return nil
+			}
+			var record SecretRecord
+			if err := json.Unmarshal(v, &record); err != nil {
+				return nil
+			}
+			if record.ExpiresAt == "" {
+				return nil
+			}
+			t, err := time.Parse(time.RFC3339, record.ExpiresAt)
+			if err == nil && t.Before(now) {
+				expired = append(expired, key)
+			}
+			return nil
+		})
+	})
+	return expired, err
 }

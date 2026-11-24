@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Plus, Eye, RotateCcw, History, Trash2, Copy, Check, KeyRound, RefreshCw, Upload } from 'lucide-react'
-import { api, type TokenRecord, type SecretVersion } from '@/lib/api'
+import { Plus, Eye, RotateCcw, History, Trash2, Copy, Check, KeyRound, RefreshCw, Upload, Timer } from 'lucide-react'
+import { api, type TokenRecord, type SecretVersion, type SecretMeta } from '@/lib/api'
 import { toast } from 'sonner'
 import { useTheme } from 'next-themes'
 import CodeMirror from '@uiw/react-codemirror'
@@ -40,6 +40,21 @@ interface ValueModal {
 interface HistoryModal {
   key: string
   versions: SecretVersion[]
+}
+
+const TTL_PRESETS = ['1d', '7d', '14d', '30d', '90d']
+
+function ttlBadge(expiresAt?: string): { label: string; cls: string } | null {
+  if (!expiresAt) return null
+  const ms = new Date(expiresAt).getTime() - Date.now()
+  const rose  = 'bg-rose-100 text-rose-800 border-rose-200 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-800'
+  const amber = 'bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-950 dark:text-amber-300 dark:border-amber-800'
+  const green = 'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-950 dark:text-emerald-300 dark:border-emerald-800'
+  if (ms <= 0)          return { label: 'past due',                          cls: rose  }
+  if (ms < 60_000)      return { label: `${Math.ceil(ms / 1000)}s left`,     cls: amber }
+  if (ms < 3_600_000)   return { label: `${Math.floor(ms / 60_000)}m left`,  cls: amber }
+  if (ms < 86_400_000)  return { label: `${Math.floor(ms / 3_600_000)}h left`, cls: amber }
+  return                       { label: `${Math.floor(ms / 86_400_000)}d left`, cls: green }
 }
 
 function CopyButton({ text, className }: { text: string; className?: string }) {
@@ -117,14 +132,20 @@ function parseEnvFile(text: string): Record<string, string> {
 export function SecretsView({ token, tokenInfo, sealed }: Props) {
   const [namespaces, setNamespaces] = useState<string[]>([])
   const [ns, setNs] = useState('')
-  const [keys, setKeys] = useState<string[]>([])
+  const [metas, setMetas] = useState<SecretMeta[]>([])
   const [loading, setLoading] = useState(false)
 
   // Table mode state
   const [addOpen, setAddOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [newVal, setNewVal] = useState('')
+  const [newTTL, setNewTTL] = useState('')
   const [putting, setPutting] = useState(false)
+
+  // Set-TTL dialog
+  const [ttlTarget, setTtlTarget] = useState<SecretMeta | null>(null)
+  const [ttlInput, setTtlInput] = useState('')
+  const [ttlSaving, setTtlSaving] = useState(false)
   const [valueModal, setValueModal] = useState<ValueModal | null>(null)
   const [historyModal, setHistoryModal] = useState<HistoryModal | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
@@ -182,11 +203,11 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
     }
   }, [token, tokenInfo, isRoot, ns])
 
-  const loadKeys = useCallback(async () => {
+  const loadMetas = useCallback(async () => {
     if (!ns) return
     setLoading(true)
-    const list = await api.listSecrets(token, ns).catch(() => [])
-    setKeys(Array.isArray(list) ? list : [])
+    const list = await api.listSecretMeta(token, ns).catch(() => [])
+    setMetas(Array.isArray(list) ? list : [])
     setLoading(false)
   }, [token, ns])
 
@@ -205,7 +226,7 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
   }, [token, ns])
 
   useEffect(() => { loadNamespaces() }, [loadNamespaces])
-  useEffect(() => { if (ns) loadKeys() }, [loadKeys, ns])
+  useEffect(() => { if (ns) loadMetas() }, [loadMetas, ns])
   useEffect(() => { if (mode === 'json') loadJsonMode() }, [mode, loadJsonMode])
 
   async function handleGet(key: string) {
@@ -237,23 +258,45 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
 
   async function handleDelete(key: string) {
     await api.deleteSecret(token, ns, key)
-      .then(() => { toast.success(`Deleted "${key}"`); loadKeys() })
+      .then(() => { toast.success(`Deleted "${key}"`); loadMetas() })
       .catch(e => toast.error('Delete failed', { description: String(e) }))
   }
 
   async function handlePut() {
     if (!newKey.trim() || !newVal.trim()) return
     setPutting(true)
-    await api.putSecret(token, ns, newKey.trim(), newVal.trim())
-      .then(() => {
-        toast.success(`Saved "${newKey.trim()}"`)
-        setNewKey('')
-        setNewVal('')
-        setAddOpen(false)
-        loadKeys()
-      })
-      .catch(e => toast.error('Save failed', { description: String(e) }))
+    try {
+      await api.putSecret(token, ns, newKey.trim(), newVal.trim())
+      if (newTTL.trim()) {
+        await api.setSecretTTL(token, ns, newKey.trim(), newTTL.trim()).catch(() => {})
+      }
+      toast.success(`Saved "${newKey.trim()}"${newTTL ? ` · TTL ${newTTL}` : ''}`)
+      setNewKey('')
+      setNewVal('')
+      setNewTTL('')
+      setAddOpen(false)
+      loadMetas()
+    } catch (e) {
+      toast.error('Save failed', { description: String(e) })
+    }
     setPutting(false)
+  }
+
+  async function handleSetTTL() {
+    if (!ttlTarget) return
+    setTtlSaving(true)
+    try {
+      await api.setSecretTTL(token, ns, ttlTarget.key, ttlInput.trim())
+      toast.success(ttlInput.trim()
+        ? `TTL set to ${ttlInput.trim()} for "${ttlTarget.key}"`
+        : `TTL cleared for "${ttlTarget.key}"`)
+      setTtlTarget(null)
+      setTtlInput('')
+      loadMetas()
+    } catch (e) {
+      toast.error('Failed to set TTL', { description: String(e) })
+    }
+    setTtlSaving(false)
   }
 
   async function saveJsonDraft() {
@@ -306,7 +349,7 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
       if (added) parts.push(`${added} added`)
       if (updated) parts.push(`${updated} updated`)
       toast.success('Saved — ' + parts.join(', '))
-      loadKeys()
+      loadMetas()
       loadJsonMode()
     }
   }
@@ -322,7 +365,7 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
     setJsonSaving(false)
     toast.success(`Deleted ${pendingDeletes.length} key${pendingDeletes.length !== 1 ? 's' : ''}`)
     setPendingDeletes([])
-    loadKeys()
+    loadMetas()
     loadJsonMode()
   }
 
@@ -330,7 +373,7 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
     setDeleteConfirmOpen(false)
     setPendingDeletes([])
     toast.success('Saved (keys not deleted)')
-    loadKeys()
+    loadMetas()
     loadJsonMode()
   }
 
@@ -411,7 +454,7 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
     setImportOpen(false)
     setImportData(null)
     setPasteContent('')
-    loadKeys()
+    loadMetas()
   }
 
   function closeImportDialog() {
@@ -441,7 +484,7 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
             <p className="text-sm text-muted-foreground mt-0.5">
               {loading
                 ? 'Loading…'
-                : `${keys.length} secret${keys.length !== 1 ? 's' : ''} in `}
+                : `${metas.length} secret${metas.length !== 1 ? 's' : ''} in `}
               {!loading && <span className="font-mono text-foreground">{ns}</span>}
             </p>
           </div>
@@ -502,22 +545,23 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
             <Table>
               <TableHeader>
                 <TableRow className="hover:bg-transparent border-b border-border">
-                  <TableHead className="w-[40%] pl-4">Key</TableHead>
-                  <TableHead className="w-[30%]">Namespace</TableHead>
+                  <TableHead className="w-[35%] pl-4">Key</TableHead>
+                  <TableHead className="w-[20%]">Namespace</TableHead>
+                  <TableHead className="w-[20%]">TTL</TableHead>
                   <TableHead className="text-right pr-4">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {loading && (
                   <TableRow>
-                    <TableCell colSpan={3} className="text-center text-muted-foreground text-sm py-16">
+                    <TableCell colSpan={4} className="text-center text-muted-foreground text-sm py-16">
                       <RefreshCw className="h-4 w-4 animate-spin mx-auto" />
                     </TableCell>
                   </TableRow>
                 )}
-                {!loading && keys.length === 0 && (
+                {!loading && metas.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={3} className="py-20">
+                    <TableCell colSpan={4} className="py-20">
                       <div className="flex flex-col items-center gap-3 text-center">
                         <div className="rounded-full bg-muted p-3">
                           <KeyRound className="h-5 w-5 text-muted-foreground" />
@@ -534,102 +578,141 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
                     </TableCell>
                   </TableRow>
                 )}
-                {keys.map(key => (
-                  <TableRow key={key} className="group">
-                    <TableCell className="pl-4">
-                      <span className="font-mono text-sm">{key}</span>
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant="outline" className="font-mono text-xs font-normal">
-                        {ns}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="pr-4">
-                      <div className="flex items-center justify-end gap-0.5">
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 opacity-60 group-hover:opacity-100 transition-opacity"
-                              onClick={() => handleGet(key)}
-                            >
-                              <Eye className="h-3.5 w-3.5" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>View value</TooltipContent>
-                        </Tooltip>
-
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 opacity-60 group-hover:opacity-100 transition-opacity"
-                              onClick={() => handleRotate(key)}
-                              disabled={!canRotate}
-                            >
-                              <RotateCcw className="h-3.5 w-3.5" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>{canRotate ? 'Rotate' : 'Requires rotate permission'}</TooltipContent>
-                        </Tooltip>
-
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 opacity-60 group-hover:opacity-100 transition-opacity"
-                              onClick={() => handleHistory(key)}
-                            >
-                              <History className="h-3.5 w-3.5" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>Version history</TooltipContent>
-                        </Tooltip>
-
-                        <Separator orientation="vertical" className="h-4 mx-1" />
-
-                        <AlertDialog>
+                {metas.map(meta => {
+                  const badge = ttlBadge(meta.expires_at)
+                  return (
+                    <TableRow key={meta.key} className="group">
+                      <TableCell className="pl-4">
+                        <span className="font-mono text-sm">{meta.key}</span>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className="font-mono text-xs font-normal">
+                          {ns}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        {badge ? (
                           <Tooltip>
                             <TooltipTrigger asChild>
-                              <AlertDialogTrigger asChild>
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-8 w-8 opacity-60 group-hover:opacity-100 transition-opacity hover:text-destructive hover:bg-destructive/10"
-                                  disabled={!canDelete}
-                                >
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                </Button>
-                              </AlertDialogTrigger>
+                              <span className={cn(
+                                'inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full border cursor-default',
+                                badge.cls,
+                              )}>
+                                <Timer className="h-3 w-3" />
+                                {badge.label}
+                              </span>
                             </TooltipTrigger>
-                            <TooltipContent>{canDelete ? 'Delete' : 'Requires delete permission'}</TooltipContent>
+                            <TooltipContent className="text-xs">
+                              {meta.ttl && <div>Interval: {meta.ttl}</div>}
+                              {meta.expires_at && <div>Next rotation: {fmtDate(meta.expires_at)}</div>}
+                            </TooltipContent>
                           </Tooltip>
-                          <AlertDialogContent>
-                            <AlertDialogHeader>
-                              <AlertDialogTitle>Delete secret</AlertDialogTitle>
-                              <AlertDialogDescription>
-                                Delete <code className="font-mono bg-muted px-1.5 py-0.5 rounded text-sm">{key}</code>?
-                                {' '}All versions will be permanently removed.
-                              </AlertDialogDescription>
-                            </AlertDialogHeader>
-                            <AlertDialogFooter>
-                              <AlertDialogCancel>Cancel</AlertDialogCancel>
-                              <AlertDialogAction
-                                onClick={() => handleDelete(key)}
-                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                        ) : (
+                          <span className="text-xs text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
+                      <TableCell className="pr-4">
+                        <div className="flex items-center justify-end gap-0.5">
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 opacity-60 group-hover:opacity-100 transition-opacity"
+                                onClick={() => handleGet(meta.key)}
                               >
-                                Delete
-                              </AlertDialogAction>
-                            </AlertDialogFooter>
-                          </AlertDialogContent>
-                        </AlertDialog>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                                <Eye className="h-3.5 w-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>View value</TooltipContent>
+                          </Tooltip>
+
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 opacity-60 group-hover:opacity-100 transition-opacity"
+                                onClick={() => handleRotate(meta.key)}
+                                disabled={!canRotate}
+                              >
+                                <RotateCcw className="h-3.5 w-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{canRotate ? 'Rotate' : 'Requires rotate permission'}</TooltipContent>
+                          </Tooltip>
+
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 opacity-60 group-hover:opacity-100 transition-opacity"
+                                onClick={() => handleHistory(meta.key)}
+                              >
+                                <History className="h-3.5 w-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Version history</TooltipContent>
+                          </Tooltip>
+
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 opacity-60 group-hover:opacity-100 transition-opacity"
+                                onClick={() => { setTtlTarget(meta); setTtlInput(meta.ttl ?? '') }}
+                                disabled={!canWrite}
+                              >
+                                <Timer className="h-3.5 w-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{canWrite ? 'Set TTL' : 'Requires write permission'}</TooltipContent>
+                          </Tooltip>
+
+                          <Separator orientation="vertical" className="h-4 mx-1" />
+
+                          <AlertDialog>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <AlertDialogTrigger asChild>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-8 w-8 opacity-60 group-hover:opacity-100 transition-opacity hover:text-destructive hover:bg-destructive/10"
+                                    disabled={!canDelete}
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </Button>
+                                </AlertDialogTrigger>
+                              </TooltipTrigger>
+                              <TooltipContent>{canDelete ? 'Delete' : 'Requires delete permission'}</TooltipContent>
+                            </Tooltip>
+                            <AlertDialogContent>
+                              <AlertDialogHeader>
+                                <AlertDialogTitle>Delete secret</AlertDialogTitle>
+                                <AlertDialogDescription>
+                                  Delete <code className="font-mono bg-muted px-1.5 py-0.5 rounded text-sm">{meta.key}</code>?
+                                  {' '}All versions will be permanently removed.
+                                </AlertDialogDescription>
+                              </AlertDialogHeader>
+                              <AlertDialogFooter>
+                                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                                <AlertDialogAction
+                                  onClick={() => handleDelete(meta.key)}
+                                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                >
+                                  Delete
+                                </AlertDialogAction>
+                              </AlertDialogFooter>
+                            </AlertDialogContent>
+                          </AlertDialog>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
               </TableBody>
             </Table>
           </div>
@@ -696,7 +779,7 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
         )}
 
         {/* Add secret dialog */}
-        <Dialog open={addOpen} onOpenChange={open => { setAddOpen(open); if (!open) { setNewKey(''); setNewVal('') } }}>
+        <Dialog open={addOpen} onOpenChange={open => { setAddOpen(open); if (!open) { setNewKey(''); setNewVal(''); setNewTTL('') } }}>
           <DialogContent className="sm:max-w-md">
             <DialogHeader>
               <DialogTitle>Add secret</DialogTitle>
@@ -711,10 +794,13 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
                   id="secret-key"
                   placeholder="DATABASE_URL"
                   value={newKey}
-                  onChange={e => setNewKey(e.target.value)}
-                  className="font-mono text-sm"
+                  onChange={e => setNewKey(e.target.value.replace(/\s/g, '_'))}
+                  className={cn('font-mono text-sm', newKey && /\s/.test(newKey) && 'border-destructive focus-visible:ring-destructive')}
                   autoFocus
                 />
+                {newKey && /\s/.test(newKey) && (
+                  <p className="text-[11px] text-destructive">Key cannot contain whitespace — spaces are converted to underscores.</p>
+                )}
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="secret-val" className="text-xs text-muted-foreground">Value</Label>
@@ -727,11 +813,89 @@ export function SecretsView({ token, tokenInfo, sealed }: Props) {
                   onKeyDown={e => e.key === 'Enter' && handlePut()}
                 />
               </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs text-muted-foreground flex items-center gap-1.5">
+                  <Timer className="h-3 w-3" />
+                  Auto-rotation TTL <span className="text-muted-foreground/50">(optional)</span>
+                </Label>
+                <div className="flex flex-wrap gap-1.5 mb-1.5">
+                  {TTL_PRESETS.map(p => (
+                    <button
+                      key={p}
+                      type="button"
+                      onClick={() => setNewTTL(newTTL === p ? '' : p)}
+                      className={cn(
+                        'text-xs px-2.5 py-1 rounded-full border font-medium transition-all',
+                        newTTL === p
+                          ? 'bg-foreground text-background border-foreground'
+                          : 'border-border text-muted-foreground hover:border-muted-foreground/60 hover:text-foreground'
+                      )}
+                    >
+                      {p}
+                    </button>
+                  ))}
+                </div>
+                <Input
+                  placeholder="Custom (e.g. 12h, 45d)"
+                  value={newTTL}
+                  onChange={e => setNewTTL(e.target.value)}
+                  className="font-mono text-sm h-8"
+                />
+              </div>
             </div>
             <DialogFooter>
               <Button variant="outline" onClick={() => setAddOpen(false)}>Cancel</Button>
-              <Button onClick={handlePut} disabled={!newKey.trim() || !newVal.trim() || putting}>
+              <Button onClick={handlePut} disabled={!newKey.trim() || /\s/.test(newKey) || !newVal.trim() || putting}>
                 {putting ? 'Saving…' : 'Save secret'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Set TTL dialog */}
+        <Dialog open={!!ttlTarget} onOpenChange={open => { if (!open) { setTtlTarget(null); setTtlInput('') } }}>
+          <DialogContent className="sm:max-w-sm">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Timer className="h-4 w-4" />
+                Auto-rotation TTL
+              </DialogTitle>
+              <DialogDescription>
+                Secret will be automatically rotated after the TTL expires.
+                {' '}Set empty to disable.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3 py-1">
+              <p className="text-xs font-mono text-muted-foreground">{ttlTarget?.key}</p>
+              <div className="flex flex-wrap gap-1.5">
+                {TTL_PRESETS.map(p => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => setTtlInput(ttlInput === p ? '' : p)}
+                    className={cn(
+                      'text-xs px-2.5 py-1 rounded-full border font-medium transition-all',
+                      ttlInput === p
+                        ? 'bg-foreground text-background border-foreground'
+                        : 'border-border text-muted-foreground hover:border-muted-foreground/60 hover:text-foreground'
+                    )}
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+              <Input
+                placeholder="Custom (e.g. 12h, 45d) or clear to disable"
+                value={ttlInput}
+                onChange={e => setTtlInput(e.target.value)}
+                className="font-mono text-sm"
+                autoFocus
+              />
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => { setTtlTarget(null); setTtlInput('') }}>Cancel</Button>
+              <Button onClick={handleSetTTL} disabled={ttlSaving}>
+                {ttlSaving ? 'Saving…' : ttlInput.trim() ? 'Set TTL' : 'Clear TTL'}
               </Button>
             </DialogFooter>
           </DialogContent>

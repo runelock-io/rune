@@ -19,9 +19,45 @@ export interface VaultStats {
   tokens_by_month: MonthCount[]
 }
 
+export interface K8sMapping {
+  id: string
+  name: string
+  rune_namespace: string
+  keys: string[]
+  target_secret: string
+  target_k8s_ns: string
+  secret_type: string
+  refresh_interval: string
+  created_at: string
+}
+
+export interface K8sSyncStatus {
+  mapping_id: string
+  last_sync: string
+  status: 'synced' | 'error' | 'pending'
+  message: string
+  secret_count: number
+}
+
+export interface K8sMappingWithStatus extends K8sMapping {
+  sync_status?: K8sSyncStatus
+}
+
 export interface NamespacePermission {
   namespace: string
   permissions: string[]
+}
+
+export interface AuditEvent {
+  id: string
+  timestamp: string
+  type: string
+  actor: string
+  actor_id: string
+  resource: string
+  status: 'success' | 'failure'
+  message: string
+  ip: string
 }
 
 export interface TokenRecord {
@@ -33,6 +69,14 @@ export interface TokenRecord {
   revoked: boolean
   system?: boolean
   read_only?: boolean
+  platform?: string
+}
+
+export interface UserAccount {
+  username: string
+  token_id: string
+  namespaces?: NamespacePermission[]
+  created_at: string
 }
 
 export const ALL_PERMS = ['read', 'write', 'delete', 'rotate'] as const
@@ -43,6 +87,16 @@ export interface SecretVersion {
   created_at: string
   updated_at: string
   rotated_at: string
+}
+
+export interface SecretMeta {
+  key: string
+  version: number
+  created_at: string
+  updated_at: string
+  rotated_at?: string
+  ttl?: string
+  expires_at?: string
 }
 
 const hdr = (token: string) => ({
@@ -134,11 +188,24 @@ export const api = {
       body: JSON.stringify({ name, namespaces }),
     }).then(check).then(r => r.json()),
 
-  createSystemToken: (token: string, name: string, namespace: string): Promise<{ token: string; record: TokenRecord }> =>
+  createSystemToken: (token: string, name: string, namespace: string, platform: string): Promise<{ token: string; record: TokenRecord }> =>
     fetch('/token/create-system', {
       method: 'POST', ...hdr(token),
-      body: JSON.stringify({ name, namespace }),
+      body: JSON.stringify({ name, namespace, platform }),
     }).then(check).then(r => r.json()),
+
+  listSecretMeta: (token: string, ns: string): Promise<SecretMeta[]> =>
+    fetch(`/secret/meta?namespace=${encodeURIComponent(ns)}`, hdr(token))
+      .then(check).then(r => r.json()),
+
+  setSecretTTL: (token: string, ns: string, key: string, ttl: string) =>
+    fetch('/secret/ttl', {
+      method: 'POST', ...hdr(token),
+      body: JSON.stringify({ namespace: ns, key, ttl }),
+    }).then(check),
+
+  listAuditEvents: (token: string, limit = 200): Promise<AuditEvent[]> =>
+    fetch(`/audit/events?limit=${limit}`, hdr(token)).then(check).then(r => r.json()),
 
   revokeToken: (token: string, id: string) =>
     fetch('/token/revoke', {
@@ -148,4 +215,48 @@ export const api = {
 
   getStats: (token: string): Promise<VaultStats> =>
     fetch('/stats', hdr(token)).then(check).then(r => r.json()),
+
+  listK8sMappings: (token: string): Promise<K8sMappingWithStatus[]> =>
+    fetch('/k8s/mappings', hdr(token)).then(check).then(r => r.json()),
+
+  createK8sMapping: (
+    token: string,
+    payload: {
+      name: string
+      rune_namespace: string
+      keys: string[]
+      target_secret: string
+      target_k8s_ns: string
+      secret_type: string
+      refresh_interval: string
+    }
+  ): Promise<K8sMapping> =>
+    fetch('/k8s/mapping/create', { method: 'POST', ...hdr(token), body: JSON.stringify(payload) })
+      .then(check).then(r => r.json()),
+
+  deleteK8sMapping: (token: string, id: string) =>
+    fetch('/k8s/mapping/delete', { method: 'POST', ...hdr(token), body: JSON.stringify({ id }) })
+      .then(check),
+
+  userLogin: (username: string, password: string): Promise<{ token: string }> =>
+    fetch('/user/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    }).then(check).then(r => r.json()),
+
+  createUser: (token: string, username: string, password: string, namespaces: NamespacePermission[]) =>
+    fetch('/user/create', {
+      method: 'POST', ...hdr(token),
+      body: JSON.stringify({ username, password, namespaces }),
+    }).then(check),
+
+  listUsers: (token: string): Promise<UserAccount[]> =>
+    fetch('/user/list', hdr(token)).then(check).then(r => r.json()),
+
+  deleteUser: (token: string, username: string) =>
+    fetch('/user/delete', {
+      method: 'POST', ...hdr(token),
+      body: JSON.stringify({ username }),
+    }).then(check),
 }

@@ -1,5 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Plus, Trash2, Lock, Copy, Check, KeySquare, Bot, X, ShieldCheck } from 'lucide-react'
+import k8sIcon  from '@/assets/k8s.png'
+import javaIcon from '@/assets/java.png'
+import jsIcon   from '@/assets/js.png'
+import goIcon   from '@/assets/go.png'
+import { Plus, Trash2, Lock, Copy, Check, KeySquare, Bot, X, ShieldCheck, ChevronDown, ChevronUp } from 'lucide-react'
 import { api, type TokenRecord, type NamespacePermission, ALL_PERMS } from '@/lib/api'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
@@ -209,6 +213,89 @@ function NsPermRow({ index, ns, perms, namespaces, usedNamespaces, onChange, onR
   )
 }
 
+// ─── Platform definitions ─────────────────────────────────────────────────────
+
+const PLATFORMS = [
+  {
+    id: 'kubernetes',
+    name: 'Kubernetes',
+    desc: 'Operator — syncs all namespaces',
+    icon: k8sIcon,
+    placeholder: 'e.g. k8s-operator-prod',
+  },
+  {
+    id: 'java',
+    name: 'Java',
+    desc: 'Spring Boot / Java SDK',
+    icon: javaIcon,
+    placeholder: 'e.g. spring-prod',
+  },
+  {
+    id: 'nodejs',
+    name: 'Node.js',
+    desc: 'Express / NestJS / Next.js',
+    icon: jsIcon,
+    placeholder: 'e.g. node-worker',
+  },
+  {
+    id: 'go',
+    name: 'Go',
+    desc: 'Go SDK / microservices',
+    icon: goIcon,
+    placeholder: 'e.g. go-service-prod',
+  },
+]
+
+function getSetupSnippet(platform: string, token: string): string {
+  switch (platform) {
+    case 'kubernetes':
+      return `# Update the operator credentials secret
+kubectl create secret generic rune-operator-credentials \\
+  --namespace rune-system \\
+  --from-literal=RUNE_SERVER="http://host.docker.internal:2710" \\
+  --from-literal=RUNE_TOKEN="${token}" \\
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Restart the operator to pick up the new token
+kubectl rollout restart deploy/rune-operator -n rune-system`
+
+    case 'java':
+      return `# application.properties
+rune.system-token=${token}
+rune.server-url=http://localhost:2710
+
+# Or as an environment variable
+export RUNE_SYSTEM_TOKEN="${token}"
+export RUNE_SERVER_URL="http://localhost:2710"`
+
+    case 'nodejs':
+      return `# .env
+RUNE_SYSTEM_TOKEN="${token}"
+RUNE_SERVER_URL="http://localhost:2710"
+
+# Usage in code
+const { RuneClient } = require('@runelock/node-sdk')
+const rune = new RuneClient({
+  serverUrl: process.env.RUNE_SERVER_URL,
+  systemToken: process.env.RUNE_SYSTEM_TOKEN,
+})`
+
+    case 'go':
+      return `# Set environment variables
+export RUNE_SYSTEM_TOKEN="${token}"
+export RUNE_SERVER_URL="http://localhost:2710"
+
+// Usage in code
+client := rune.NewClient(rune.Config{
+    ServerURL:   os.Getenv("RUNE_SERVER_URL"),
+    SystemToken: os.Getenv("RUNE_SYSTEM_TOKEN"),
+})`
+
+    default:
+      return token
+  }
+}
+
 // ─── Main view ────────────────────────────────────────────────────────────────
 
 export function TokensView({ token, tokenInfo }: Props) {
@@ -223,13 +310,15 @@ export function TokensView({ token, tokenInfo }: Props) {
 
   // System token dialog
   const [sysAddOpen, setSysAddOpen] = useState(false)
+  const [sysPlatform, setSysPlatform] = useState<string | null>(null)
   const [sysNewName, setSysNewName] = useState('')
   const [sysNewNs, setSysNewNs] = useState('')
   const [sysCreating, setSysCreating] = useState(false)
 
   // Reveal modal — shared
   const [revealedToken, setRevealedToken] = useState<string | null>(null)
-  const [revealedIsSystem, setRevealedIsSystem] = useState(false)
+  const [revealedPlatform, setRevealedPlatform] = useState<string | null>(null)
+  const [revealSnippetOpen, setRevealSnippetOpen] = useState(false)
 
   const isRoot = tokenInfo?.namespace === '*'
 
@@ -295,7 +384,7 @@ export function TokensView({ token, tokenInfo }: Props) {
     await api.createToken(token, newName.trim(), nps)
       .then(r => {
         setRevealedToken(r.token)
-        setRevealedIsSystem(false)
+        setRevealedPlatform(null)
         resetAddDialog()
         setAddOpen(false)
         load()
@@ -306,14 +395,16 @@ export function TokensView({ token, tokenInfo }: Props) {
 
   async function handleCreateSystem() {
     const name = sysNewName.trim()
-    const ns = sysNewNs.trim()
+    const ns = sysPlatform === 'kubernetes' ? '*' : sysNewNs.trim()
     if (!name || !ns) return
     setSysCreating(true)
-    await api.createSystemToken(token, name, ns)
+    await api.createSystemToken(token, name, ns, sysPlatform ?? '')
       .then(r => {
         setRevealedToken(r.token)
-        setRevealedIsSystem(true)
+        setRevealedPlatform(sysPlatform)
+        setRevealSnippetOpen(false)
         setSysNewName('')
+        setSysPlatform(null)
         setSysNewNs(namespaces[0] ?? '')
         setSysAddOpen(false)
         load()
@@ -365,6 +456,7 @@ export function TokensView({ token, tokenInfo }: Props) {
               <TableHead className="pl-4">Name</TableHead>
               <TableHead>Access</TableHead>
               <TableHead>Type</TableHead>
+              <TableHead>Platform</TableHead>
               <TableHead>Created</TableHead>
               <TableHead>Status</TableHead>
               <TableHead className="w-14 text-right pr-4">Actions</TableHead>
@@ -373,7 +465,7 @@ export function TokensView({ token, tokenInfo }: Props) {
           <TableBody>
             {tokens.length === 0 && (
               <TableRow>
-                <TableCell colSpan={6} className="py-16">
+                <TableCell colSpan={7} className="py-16">
                   <div className="flex flex-col items-center gap-3 text-center">
                     <div className="rounded-full bg-muted p-3">
                       <KeySquare className="h-5 w-5 text-muted-foreground" />
@@ -404,6 +496,21 @@ export function TokensView({ token, tokenInfo }: Props) {
                     <span className="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full border border-border text-muted-foreground">
                       regular
                     </span>
+                  )}
+                </TableCell>
+                <TableCell className="pt-3">
+                  {t.platform ? (() => {
+                    const pl = PLATFORMS.find(p => p.id === t.platform)
+                    return pl ? (
+                      <span className="inline-flex items-center gap-1.5">
+                        <img src={pl.icon} alt={pl.name} className="h-4 w-4 object-contain" />
+                        <span className="text-xs text-muted-foreground">{pl.name}</span>
+                      </span>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">{t.platform}</span>
+                    )
+                  })() : (
+                    <span className="text-xs text-muted-foreground/40">—</span>
                   )}
                 </TableCell>
                 <TableCell className="pt-3.5 text-sm text-muted-foreground">{fmt(t.created_at)}</TableCell>
@@ -533,60 +640,102 @@ export function TokensView({ token, tokenInfo }: Props) {
       {/* ── Add system token dialog ── */}
       <Dialog open={sysAddOpen} onOpenChange={open => {
         setSysAddOpen(open)
-        if (!open) { setSysNewName(''); setSysNewNs(namespaces[0] ?? '') }
+        if (!open) { setSysNewName(''); setSysPlatform(null); setSysNewNs(namespaces[0] ?? '') }
       }}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Bot className="h-4 w-4 text-sky-400" />
               Create System Token
             </DialogTitle>
             <DialogDescription>
-              Read-only SDK token with sealed-vault access. Used by SDKs to read secrets even when the vault is locked.
+              Read-only token scoped to a platform. Choose your integration to get a tailored setup guide.
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-4 py-2">
-            <div className="space-y-1.5">
-              <Label htmlFor="sys-token-name">Name</Label>
-              <Input
-                id="sys-token-name"
-                placeholder="e.g. spring-prod, node-worker…"
-                value={sysNewName}
-                onChange={e => setSysNewName(e.target.value)}
-                autoFocus
-              />
+          <div className="space-y-5 py-2">
+            {/* Platform picker */}
+            <div className="space-y-2">
+              <Label>Platform</Label>
+              <div className="grid grid-cols-2 gap-2">
+                {PLATFORMS.map(p => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => setSysPlatform(p.id)}
+                    className={cn(
+                      'flex items-center gap-3 rounded-lg border p-3 text-left transition-all',
+                      sysPlatform === p.id
+                        ? 'border-primary bg-primary/5 ring-1 ring-primary'
+                        : 'border-border hover:border-muted-foreground/40 hover:bg-muted/40'
+                    )}
+                  >
+                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted/60">
+                      <img src={p.icon} alt={p.name} className="h-5 w-5 object-contain" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium leading-none">{p.name}</p>
+                      <p className="mt-1 text-xs text-muted-foreground">{p.desc}</p>
+                    </div>
+                  </button>
+                ))}
+              </div>
             </div>
 
-            <div className="space-y-1.5">
-              <Label>Namespace</Label>
-              <Select value={sysNewNs} onValueChange={setSysNewNs}>
-                <SelectTrigger className="font-mono text-sm">
-                  <SelectValue placeholder="Select namespace…" />
-                </SelectTrigger>
-                <SelectContent>
-                  {namespaces.map(ns => (
-                    <SelectItem key={ns} value={ns} className="font-mono text-xs">{ns}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+            {sysPlatform && (
+              <>
+                <div className="space-y-1.5">
+                  <Label>Token name</Label>
+                  <Input
+                    placeholder={PLATFORMS.find(p => p.id === sysPlatform)?.placeholder ?? 'e.g. prod-reader'}
+                    value={sysNewName}
+                    onChange={e => setSysNewName(e.target.value)}
+                    autoFocus
+                  />
+                </div>
 
-            <div className="rounded-lg bg-sky-500/10 border border-sky-500/20 px-3.5 py-3 space-y-1">
-              <p className="text-xs font-medium text-sky-300">Read-only · Sealed-vault access</p>
-              <p className="text-xs text-muted-foreground">
-                This token can only read secrets. It uses dual encryption so it works even when the vault passphrase is not loaded.
-              </p>
-            </div>
+                {sysPlatform !== 'kubernetes' ? (
+                  <div className="space-y-1.5">
+                    <Label>Namespace</Label>
+                    <Select value={sysNewNs} onValueChange={setSysNewNs}>
+                      <SelectTrigger className="font-mono text-sm">
+                        <SelectValue placeholder="Select namespace…" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {namespaces.map(ns => (
+                          <SelectItem key={ns} value={ns} className="font-mono text-xs">{ns}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 px-3.5 py-3 space-y-1">
+                    <p className="text-xs font-medium text-blue-400">Wildcard namespace · reads all namespaces</p>
+                    <p className="text-xs text-muted-foreground">
+                      The Kubernetes operator syncs secrets across namespaces and needs vault-wide read access.
+                    </p>
+                  </div>
+                )}
+
+                <div className="rounded-lg bg-sky-500/10 border border-sky-500/20 px-3.5 py-3 space-y-1">
+                  <p className="text-xs font-medium text-sky-300">Read-only · system token</p>
+                  <p className="text-xs text-muted-foreground">
+                    {sysPlatform === 'kubernetes'
+                      ? 'This token is used by the rune-operator to sync secrets into K8s. It cannot write or delete.'
+                      : 'This token can only read secrets. It uses dual encryption and works even when the vault is sealed.'}
+                  </p>
+                </div>
+              </>
+            )}
           </div>
 
           <DialogFooter>
             <Button variant="outline" onClick={() => setSysAddOpen(false)}>Cancel</Button>
             <Button
               onClick={handleCreateSystem}
-              disabled={!sysNewName.trim() || !sysNewNs.trim() || sysCreating}
+              disabled={!sysPlatform || !sysNewName.trim() || (sysPlatform !== 'kubernetes' && !sysNewNs.trim()) || sysCreating}
             >
-              {sysCreating ? 'Creating…' : 'Create System Token'}
+              {sysCreating ? 'Creating…' : 'Create Token'}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -594,22 +743,57 @@ export function TokensView({ token, tokenInfo }: Props) {
 
       {/* ── Token reveal modal ── */}
       <Dialog open={!!revealedToken} onOpenChange={open => !open && setRevealedToken(null)}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>{revealedIsSystem ? 'System token created' : 'Token created'}</DialogTitle>
+            <DialogTitle>
+              {revealedPlatform
+                ? `${PLATFORMS.find(p => p.id === revealedPlatform)?.name ?? ''} token created`
+                : 'Token created'}
+            </DialogTitle>
             <DialogDescription>
-              {revealedIsSystem
-                ? 'Set this as RUNE_SYSTEM_TOKEN in your SDK config. It will not be shown again.'
+              {revealedPlatform
+                ? 'Copy the token — it will not be shown again.'
                 : 'Save this token somewhere safe — it will not be shown again.'}
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-3">
-            <div className="rounded-lg bg-muted border border-border p-3">
-              <code className="block font-mono text-xs break-all leading-relaxed select-all">
-                {revealedToken}
-              </code>
+
+          <div className="space-y-4">
+            {/* Token value */}
+            <div className="space-y-2">
+              <div className="rounded-lg bg-muted border border-border p-3">
+                <code className="block font-mono text-xs break-all leading-relaxed select-all">
+                  {revealedToken}
+                </code>
+              </div>
+              <CopyButton text={revealedToken ?? ''} />
             </div>
-            <CopyButton text={revealedToken ?? ''} />
+
+            {/* Platform-specific setup snippet */}
+            {revealedPlatform && revealedToken && (
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  onClick={() => setRevealSnippetOpen(v => !v)}
+                >
+                  {revealSnippetOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                  Setup instructions
+                </button>
+                {revealSnippetOpen && (
+                  <div className="rounded-lg border border-border bg-[#1e1e2e] p-4 space-y-1">
+                    <div className="flex items-center gap-1.5 mb-2">
+                      {(() => { const pl = PLATFORMS.find(p => p.id === revealedPlatform); return pl ? <img src={pl.icon} alt={pl.name} className="h-3.5 w-3.5 object-contain" /> : null })()}
+                      <p className="text-[10px] text-muted-foreground font-mono">
+                        {PLATFORMS.find(p => p.id === revealedPlatform)?.name}
+                      </p>
+                    </div>
+                    <pre className="font-mono text-xs text-slate-200 whitespace-pre-wrap break-all leading-relaxed">
+                      {getSetupSnippet(revealedPlatform, revealedToken)}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </DialogContent>
       </Dialog>

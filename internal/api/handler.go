@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"rune/internal/audit"
 	"rune/internal/auth"
 	"rune/internal/crypto"
 	"rune/internal/middleware"
@@ -11,6 +13,7 @@ import (
 	"rune/internal/service"
 	"rune/internal/storage"
 	"strconv"
+	"time"
 )
 
 type Handler struct {
@@ -19,17 +22,37 @@ type Handler struct {
 	tokenService     *service.TokenService
 	store            storage.Store
 	sealer           *seal.Manager
+	audit            *audit.Logger
 }
 
 func NewHandler(s *service.SecretService, t *service.TokenService, ns *service.NamespaceService,
-	store storage.Store, sealer *seal.Manager) *Handler {
+	store storage.Store, sealer *seal.Manager, auditLogger *audit.Logger) *Handler {
 	return &Handler{
 		secretService:    s,
 		tokenService:     t,
 		namespaceService: ns,
 		store:            store,
 		sealer:           sealer,
+		audit:            auditLogger,
 	}
+}
+
+func (h *Handler) logEvent(r *http.Request, typ, resource, status, msg string) {
+	rec := middleware.GetTokenRecord(r)
+	if rec == nil {
+		return
+	}
+	h.audit.Log(audit.Event{
+		ID:        fmt.Sprintf("%020d", time.Now().UnixNano()),
+		Timestamp: time.Now().Format(time.RFC3339),
+		Type:      typ,
+		Actor:     rec.Name,
+		ActorID:   rec.ID,
+		Resource:  resource,
+		Status:    status,
+		Message:   msg,
+		IP:        r.RemoteAddr,
+	})
 }
 
 // CORE VAULT
@@ -55,9 +78,11 @@ func (h *Handler) PutSecret(w http.ResponseWriter, r *http.Request) {
 
 	err := h.secretService.Put(namespaceName, req.Key, req.Value)
 	if err != nil {
+		h.logEvent(r, audit.TypeSecretCreate, namespaceName+"/"+req.Key, audit.StatusFailure, err.Error())
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
+	h.logEvent(r, audit.TypeSecretCreate, namespaceName+"/"+req.Key, audit.StatusSuccess, "")
 	w.WriteHeader(http.StatusCreated)
 }
 func (h *Handler) GetSecret(w http.ResponseWriter, r *http.Request) {
@@ -82,9 +107,11 @@ func (h *Handler) GetSecret(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
+		h.logEvent(r, audit.TypeSecretRead, namespaceName+"/"+key, audit.StatusFailure, err.Error())
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	h.logEvent(r, audit.TypeSecretRead, namespaceName+"/"+key, audit.StatusSuccess, "")
 	json.NewEncoder(w).Encode(map[string]string{
 		"value": val,
 	})
@@ -112,6 +139,7 @@ func (h *Handler) ListSecrets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.logEvent(r, audit.TypeSecretList, namespaceName, audit.StatusSuccess, "")
 	json.NewEncoder(w).Encode(keys)
 }
 func (h *Handler) DeleteSecret(w http.ResponseWriter, r *http.Request) {
@@ -150,6 +178,7 @@ func (h *Handler) DeleteSecret(w http.ResponseWriter, r *http.Request) {
 		key,
 	)
 	if err != nil {
+		h.logEvent(r, audit.TypeSecretDelete, namespace+"/"+key, audit.StatusFailure, err.Error())
 		http.Error(
 			w,
 			err.Error(),
@@ -157,6 +186,7 @@ func (h *Handler) DeleteSecret(w http.ResponseWriter, r *http.Request) {
 		)
 		return
 	}
+	h.logEvent(r, audit.TypeSecretDelete, namespace+"/"+key, audit.StatusSuccess, "")
 	w.WriteHeader(http.StatusOK)
 }
 func (h *Handler) RotateSecret(w http.ResponseWriter, r *http.Request) {
@@ -174,10 +204,11 @@ func (h *Handler) RotateSecret(w http.ResponseWriter, r *http.Request) {
 
 	value, err := h.secretService.Rotate(namespaceName, key)
 	if err != nil {
+		h.logEvent(r, audit.TypeSecretRotate, namespaceName+"/"+key, audit.StatusFailure, err.Error())
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
-
+	h.logEvent(r, audit.TypeSecretRotate, namespaceName+"/"+key, audit.StatusSuccess, "")
 	json.NewEncoder(w).Encode(map[string]string{
 		"value": value,
 	})
@@ -200,15 +231,18 @@ func (h *Handler) Unseal(w http.ResponseWriter, r *http.Request) {
 
 	plaintext, err := crypto.Decrypt(key, record.Ciphertext, record.Nonce)
 	if err != nil || string(plaintext) != "rune-check" {
+		h.logEvent(r, audit.TypeVaultUnseal, "vault", audit.StatusFailure, "invalid passphrase")
 		http.Error(w, "Invalid Passphrase", http.StatusUnauthorized)
 		return
 	}
 
 	h.sealer.Unseal(key)
+	h.logEvent(r, audit.TypeVaultUnseal, "vault", audit.StatusSuccess, "")
 	w.Write([]byte("unsealed"))
 
 }
 func (h *Handler) Seal(w http.ResponseWriter, r *http.Request) {
+	h.logEvent(r, audit.TypeVaultSeal, "vault", audit.StatusSuccess, "")
 	h.sealer.Seal()
 	w.Write([]byte("sealed"))
 }
@@ -284,10 +318,11 @@ func (h *Handler) CreateToken(w http.ResponseWriter, r *http.Request) {
 
 	token, record, err := h.tokenService.Create(req.Name, req.Namespaces)
 	if err != nil {
+		h.logEvent(r, audit.TypeTokenCreate, req.Name, audit.StatusFailure, err.Error())
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
-
+	h.logEvent(r, audit.TypeTokenCreate, req.Name, audit.StatusSuccess, "")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"token":  token,
 		"record": record,
@@ -332,10 +367,11 @@ func (h *Handler) RevokeToken(w http.ResponseWriter, r *http.Request) {
 
 	err := h.tokenService.Revoke(req.ID)
 	if err != nil {
+		h.logEvent(r, audit.TypeTokenRevoke, req.ID, audit.StatusFailure, err.Error())
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
-
+	h.logEvent(r, audit.TypeTokenRevoke, req.ID, audit.StatusSuccess, "")
 	w.Write([]byte("revoked"))
 }
 
@@ -348,6 +384,7 @@ func (h *Handler) CreateSystemToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name      string `json:"name"`
 		Namespace string `json:"namespace"`
+		Platform  string `json:"platform"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -355,12 +392,13 @@ func (h *Handler) CreateSystemToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, record, err := h.tokenService.CreateSystemToken(req.Name, req.Namespace)
+	token, record, err := h.tokenService.CreateSystemToken(req.Name, req.Namespace, req.Platform)
 	if err != nil {
+		h.logEvent(r, audit.TypeTokenCreateSystem, req.Name, audit.StatusFailure, err.Error())
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
-
+	h.logEvent(r, audit.TypeTokenCreateSystem, req.Name, audit.StatusSuccess, "")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"token":  token,
 		"record": record,
@@ -392,10 +430,11 @@ func (h *Handler) CreateNamespace(w http.ResponseWriter, r *http.Request) {
 
 	err := h.store.CreateNamespace(req.Name)
 	if err != nil {
+		h.logEvent(r, audit.TypeNamespaceCreate, req.Name, audit.StatusFailure, err.Error())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
+	h.logEvent(r, audit.TypeNamespaceCreate, req.Name, audit.StatusSuccess, "")
 	w.Write([]byte("namespace created"))
 }
 func (h *Handler) ListNamespaces(w http.ResponseWriter, r *http.Request) {
@@ -432,10 +471,11 @@ func (h *Handler) DeleteNamespace(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&req)
 	err := h.namespaceService.DeleteNamespace(req.Name)
 	if err != nil {
+		h.logEvent(r, audit.TypeNamespaceDelete, req.Name, audit.StatusFailure, err.Error())
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
-
+	h.logEvent(r, audit.TypeNamespaceDelete, req.Name, audit.StatusSuccess, "")
 	w.Write([]byte("namespace deleted"))
 }
 
@@ -473,6 +513,7 @@ func (h *Handler) GetAllSecrets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.logEvent(r, audit.TypeSecretList, namespaceName, audit.StatusSuccess, "")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(all)
 }
@@ -520,4 +561,52 @@ func (h *Handler) ListSecretVersions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(versions)
+}
+
+// TTL
+
+func (h *Handler) SetSecretTTL(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Namespace string `json:"namespace"`
+		Key       string `json:"key"`
+		TTL       string `json:"ttl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	ns := namespace.Normalize(req.Namespace)
+	if !middleware.AuthorizeOperation(r, ns, auth.PermWrite) {
+		http.Error(w, "[AUTHORIZATION DENIED]: Token cannot write to this namespace", http.StatusForbidden)
+		return
+	}
+
+	if err := h.secretService.SetTTL(ns, req.Key, req.TTL); err != nil {
+		h.logEvent(r, audit.TypeSecretSetTTL, ns+"/"+req.Key, audit.StatusFailure, err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	h.logEvent(r, audit.TypeSecretSetTTL, ns+"/"+req.Key, audit.StatusSuccess, req.TTL)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) ListSecretMeta(w http.ResponseWriter, r *http.Request) {
+	ns := namespace.Normalize(r.URL.Query().Get("namespace"))
+	if !middleware.AuthorizeOperation(r, ns, auth.PermRead) {
+		http.Error(w, "[AUTHORIZATION DENIED]: Token cannot read from this namespace", http.StatusForbidden)
+		return
+	}
+
+	metas, err := h.secretService.ListWithMeta(ns)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if metas == nil {
+		metas = []storage.SecretMeta{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metas)
 }

@@ -8,6 +8,7 @@ import (
 	"rune/internal/crypto"
 	"rune/internal/seal"
 	"rune/internal/storage"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -61,6 +62,10 @@ func (s *SecretService) Put(namespace, key, value string) error {
 
 	if cleanKey == "" {
 		return errors.New("[INVALID]: Invalid Key")
+	}
+
+	if strings.ContainsAny(cleanKey, " \t\n\r") {
+		return errors.New("[INVALID]: Secret key cannot contain whitespace — use underscores instead (e.g. DATABASE_URL)")
 	}
 
 	fullKey := ns + "/" + cleanKey
@@ -227,6 +232,12 @@ func (s *SecretService) Rotate(namespace string, key string) (string, error) {
 		UpdatedAt:  now,
 		RotatedAt:  now,
 		Version:    newVersion,
+		TTL:        existing.TTL,
+	}
+	if existing.TTL != "" {
+		if d, err := ParseTTL(existing.TTL); err == nil {
+			record.ExpiresAt = time.Now().Add(d).Format(time.RFC3339)
+		}
 	}
 
 	versionKey := storage.VersionedSecretKey(fullKey, newVersion)
@@ -369,6 +380,57 @@ func (s *SecretService) GetAll(namespace string) (map[string]string, error) {
 	}
 
 	return result, nil
+}
+
+func ParseTTL(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, "d") {
+		n, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		if err != nil || n <= 0 {
+			return 0, errors.New("invalid TTL: must be a positive number of days (e.g. 7d)")
+		}
+		// days are always >= 30s, no minimum check needed
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, errors.New("invalid TTL: use formats like 30s, 1h, 12h, 7d, 30d")
+	}
+	if d < 30*time.Second {
+		return 0, errors.New("invalid TTL: minimum rotation interval is 30s")
+	}
+	return d, nil
+}
+
+func (s *SecretService) SetTTL(namespace, key, ttl string) error {
+	if s.sealer.IsSealed() {
+		return errors.New("[OPERATION DENIED]: Vault is Sealed")
+	}
+	ns := normalizeNamespace(namespace)
+	if !s.store.NamespaceExists(ns) {
+		return errors.New("[OPERATION DENIED]: Namespace does not exist")
+	}
+	fullKey := ns + "/" + sanitizeKey(key)
+	var expiresAt string
+	if ttl != "" {
+		d, err := ParseTTL(ttl)
+		if err != nil {
+			return err
+		}
+		expiresAt = time.Now().Add(d).Format(time.RFC3339)
+	}
+	return s.store.SetSecretTTL(fullKey, ttl, expiresAt)
+}
+
+func (s *SecretService) ListWithMeta(namespace string) ([]storage.SecretMeta, error) {
+	if s.sealer.IsSealed() {
+		return nil, errors.New("[OPERATION DENIED]: Vault is Sealed")
+	}
+	ns := normalizeNamespace(namespace)
+	if !s.store.NamespaceExists(ns) {
+		return nil, errors.New("[OPERATION DENIED]: Namespace does not exist")
+	}
+	return s.store.ListSecretsWithMeta(ns)
 }
 
 func (s *SecretService) ListVersions(namespaceName string, key string) ([]SecretVersion, error) {

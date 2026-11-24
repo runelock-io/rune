@@ -22,6 +22,16 @@ type SecretVersion struct {
 	RotatedAt string `json:"rotated_at"`
 }
 
+type SecretMeta struct {
+	Key       string `json:"key"`
+	Version   int    `json:"version"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+	RotatedAt string `json:"rotated_at,omitempty"`
+	TTL       string `json:"ttl,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+}
+
 func New(baseURL string, token string) *Client {
 	return &Client{
 		BaseURL: baseURL,
@@ -453,6 +463,51 @@ func (c *Client) GetVersion(key string, namespace string, version int) (string, 
 
 	return result["value"], nil
 }
+func (c *Client) SetTTL(key, namespace, ttl string) error {
+	body := map[string]string{
+		"key":       key,
+		"namespace": namespace,
+		"ttl":       ttl,
+	}
+	data, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", c.BaseURL+"/secret/ttl", bytes.NewBuffer(data))
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%s", b)
+	}
+	return nil
+}
+
+func (c *Client) ListMeta(namespace string) ([]SecretMeta, error) {
+	reqURL := fmt.Sprintf("%s/secret/meta?namespace=%s", c.BaseURL, url.QueryEscape(namespace))
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s", b)
+	}
+	var metas []SecretMeta
+	if err := json.NewDecoder(resp.Body).Decode(&metas); err != nil {
+		return nil, err
+	}
+	return metas, nil
+}
+
 func (c *Client) ListVersions(key string, namespace string) ([]SecretVersion, error) {
 
 	reqURL := fmt.Sprintf("%s/secret/history?key=%s&namespace=%s", c.BaseURL,

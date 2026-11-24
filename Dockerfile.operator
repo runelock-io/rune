@@ -1,0 +1,3 @@
+FROM gcr.io/distroless/static:nonroot
+COPY bin/rune-operator /rune-operator
+ENTRYPOINT ["/rune-operator"]

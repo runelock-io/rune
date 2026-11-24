@@ -1,5 +1,5 @@
 import * as React from "react"
-import { KeyRound, Layers, Coins, Lock, LockKeyhole, Plug, LayoutDashboard } from "lucide-react"
+import { KeyRound, Layers, Coins, Lock, LockKeyhole, Plug, LayoutDashboard, Container, ScrollText, Users } from "lucide-react"
 import runeIcon from "@/assets/rune-icon.png"
 
 import { NavUser } from "@/components/nav-user"
@@ -39,9 +39,11 @@ interface NavItem {
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { id: "secrets",    label: "Secrets",    icon: KeyRound, rootOnly: false },
-  { id: "namespaces", label: "Namespaces", icon: Layers,   rootOnly: true  },
-  { id: "tokens",     label: "Tokens",     icon: Coins,    rootOnly: true  },
+  { id: "secrets",    label: "Secrets",    icon: KeyRound,   rootOnly: false },
+  { id: "namespaces", label: "Namespaces", icon: Layers,     rootOnly: true  },
+  { id: "tokens",     label: "Tokens",     icon: Coins,      rootOnly: true  },
+  { id: "users",      label: "Users",      icon: Users,      rootOnly: true  },
+  { id: "audit",      label: "Audit Log",  icon: ScrollText, rootOnly: true  },
 ]
 
 interface AppSidebarProps extends React.ComponentProps<typeof Sidebar> {
@@ -140,6 +142,16 @@ export function AppSidebar({ view, onNavigate, tokenInfo, onLogout, onSeal, ...p
                     >
                       <Plug />
                       <span>Integrations</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={view === "kubernetes"}
+                      onClick={() => onNavigate("kubernetes")}
+                      tooltip="Kubernetes"
+                    >
+                      <Container />
+                      <span>Kubernetes</span>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                 </SidebarMenu>

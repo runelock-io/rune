@@ -1,0 +1,91 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rune-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rune-operator
+  namespace: rune-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rune-operator
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rune-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rune-operator
+subjects:
+  - kind: ServiceAccount
+    name: rune-operator
+    namespace: rune-system
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rune-operator-credentials
+  namespace: rune-system
+type: Opaque
+stringData:
+  RUNE_SERVER: "http://host.docker.internal:2710"
+  RUNE_TOKEN: "f0d1522eb38a5dffd5e3162a072b5dbc852b01dd7b182419e4073e0ab602309a" # replace with a valid Rune token
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rune-operator
+  namespace: rune-system
+  labels:
+    app: rune-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rune-operator
+  template:
+    metadata:
+      labels:
+        app: rune-operator
+    spec:
+      serviceAccountName: rune-operator
+      containers:
+        - name: rune-operator
+          image: rune-operator:dev
+          imagePullPolicy: Never
+          env:
+            - name: RUNE_SERVER
+              valueFrom:
+                secretKeyRef:
+                  name: rune-operator-credentials
+                  key: RUNE_SERVER
+            - name: RUNE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: rune-operator-credentials
+                  key: RUNE_TOKEN
+            - name: SYNC_INTERVAL
+              value: "30s"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"

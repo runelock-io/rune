@@ -65,20 +65,50 @@ func (s *TokenService) Create(name string, namespaces []auth.NamespacePermission
 	err := s.store.SaveToken(record)
 	return token, record, err
 }
-func (s *TokenService) CreateSystemToken(name, namespace string) (string, auth.TokenRecord, error) {
+func (s *TokenService) CreateSystemToken(name, namespace, platform string) (string, auth.TokenRecord, error) {
 	if s.sealer.IsSealed() {
 		return "", auth.TokenRecord{}, errors.New("[OPERATION DENIED]: Vault is Sealed")
 	}
 
-	namespace = normalizeNamespace(namespace)
+	isWildcard := namespace == "*"
 
-	if !s.store.NamespaceExists(namespace) {
-		return "", auth.TokenRecord{}, errors.New("[OPERATION DENIED]: Namespace does not exist")
+	if !isWildcard {
+		namespace = normalizeNamespace(namespace)
+		if !s.store.NamespaceExists(namespace) {
+			return "", auth.TokenRecord{}, errors.New("[OPERATION DENIED]: Namespace does not exist")
+		}
 	}
 
 	plainToken, hash := auth.GenerateToken()
-	sysKey := crypto.DeriveSysKey(plainToken)
+
+	nsPerms := []auth.NamespacePermission{{Namespace: namespace, Permissions: []string{auth.PermRead}}}
+	id := fmt.Sprintf("stk_%d", time.Now().UnixNano())
+
+	// Wildcard (K8s operator) tokens require the vault to be unsealed — the
+	// operator runs alongside the server and has no sealed-access use case.
+	// Skip dual-encryption entirely; store no EncSysKey.
+	if isWildcard {
+		record := auth.TokenRecord{
+			ID:        id,
+			Hash:      hash,
+			Name:      name,
+			Namespace: namespace,
+			Namespaces: nsPerms,
+			CreatedAt: time.Now().Format(time.RFC3339),
+			ReadOnly:  true,
+			System:    true,
+			Platform:  platform,
+		}
+		if err := s.store.SaveToken(record); err != nil {
+			return "", auth.TokenRecord{}, err
+		}
+		return plainToken, record, nil
+	}
+
+	// Non-wildcard system tokens: dual-encrypt every namespace secret so this
+	// token can read them even when the vault is sealed.
 	vaultKey := s.sealer.GetKey()
+	sysKey := crypto.DeriveSysKey(plainToken)
 
 	encCiphertext, encNonce, err := crypto.Encrypt(vaultKey, sysKey)
 	if err != nil {
@@ -86,28 +116,23 @@ func (s *TokenService) CreateSystemToken(name, namespace string) (string, auth.T
 	}
 	encSysKey := hex.EncodeToString(encCiphertext) + ":" + hex.EncodeToString(encNonce)
 
-	id := fmt.Sprintf("stk_%d", time.Now().UnixNano())
 	record := auth.TokenRecord{
-		ID:        id,
-		Hash:      hash,
-		Name:      name,
-		Namespace: namespace, // kept for ListSystemTokensForNamespace lookup
-		Namespaces: []auth.NamespacePermission{
-			{Namespace: namespace, Permissions: []string{auth.PermRead}},
-		},
-		CreatedAt: time.Now().Format(time.RFC3339),
-		Revoked:   false,
-		ReadOnly:  true,
-		System:    true,
-		EncSysKey: encSysKey,
+		ID:         id,
+		Hash:       hash,
+		Name:       name,
+		Namespace:  namespace,
+		Namespaces: nsPerms,
+		CreatedAt:  time.Now().Format(time.RFC3339),
+		ReadOnly:   true,
+		System:     true,
+		Platform:   platform,
+		EncSysKey:  encSysKey,
 	}
 
 	if err := s.store.SaveToken(record); err != nil {
 		return "", auth.TokenRecord{}, err
 	}
 
-	// Encrypt all existing namespace secrets under the system key so this
-	// token can read them even when the vault is sealed.
 	keys, err := s.store.ListKeys()
 	if err != nil {
 		return plainToken, record, nil

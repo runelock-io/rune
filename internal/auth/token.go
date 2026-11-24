@@ -35,6 +35,7 @@ type TokenRecord struct {
 	Revoked    bool                  `json:"revoked"`
 	ReadOnly   bool                  `json:"read_only,omitempty"`
 	System     bool                  `json:"system,omitempty"`
+	Platform   string                `json:"platform,omitempty"`
 	EncSysKey  string                `json:"enc_sys_key,omitempty"`
 }
 

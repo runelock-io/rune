@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"rune/internal/api"
+	"rune/internal/audit"
 	"rune/internal/auth"
 	"rune/internal/config"
 	"rune/internal/constants"
@@ -38,9 +39,9 @@ func printBanner(dbPath string) {
 	fmt.Println()
 	fmt.Printf("  %s%srune%s  %slocal-first secrets vault%s\n", ansiBold, ansiCyan, ansiReset, ansiDim, ansiReset)
 	fmt.Println()
-	fmt.Printf("  %s➜%s  %-6s %shttp://localhost:%s%s\n",        ansiCyan, ansiReset, "api", ansiBlue, port, ansiReset)
-	fmt.Printf("  %s➜%s  %-6s %shttp://localhost:%s/ui/%s\n",    ansiCyan, ansiReset, "ui",  ansiBold+ansiBlue, port, ansiReset)
-	fmt.Printf("  %s➜%s  %-6s %s%s%s\n",                         ansiCyan, ansiReset, "db",  ansiGray, dbPath, ansiReset)
+	fmt.Printf("  %s➜%s  %-6s %s0.0.0.0:%s%s %s(all interfaces)%s\n", ansiCyan, ansiReset, "api", ansiBlue, port, ansiReset, ansiDim, ansiReset)
+	fmt.Printf("  %s➜%s  %-6s %shttp://localhost:%s/ui/%s\n",         ansiCyan, ansiReset, "ui",  ansiBold+ansiBlue, port, ansiReset)
+	fmt.Printf("  %s➜%s  %-6s %s%s%s\n",                              ansiCyan, ansiReset, "db",  ansiGray, dbPath, ansiReset)
 	fmt.Println()
 	fmt.Printf("  %s⬡  vault sealed%s  —  run %srune unseal%s or open the web UI\n", ansiYellow, ansiReset, ansiBold, ansiReset)
 	fmt.Println()
@@ -126,15 +127,36 @@ func Start() {
 	store.CreateNamespace(constants.DefaultNamespace)
 
 	sealer := seal.NewManger()
+
+	if pass := os.Getenv("RUNE_UNSEAL_PASSPHRASE"); pass != "" {
+		key := crypto.DeriveKey(pass, salt)
+		record, err := store.Get(storage.VerifyKey)
+		if err == nil {
+			if _, err := crypto.Decrypt(key, record.Ciphertext, record.Nonce); err == nil {
+				sealer.Unseal(key)
+				log.Println("vault auto-unsealed via RUNE_UNSEAL_PASSPHRASE")
+			} else {
+				log.Println("WARNING: RUNE_UNSEAL_PASSPHRASE is set but passphrase is wrong — vault remains sealed")
+			}
+		}
+	}
+
 	secretService := service.NewSecretService(store, sealer)
 	tokenService := service.NewTokenService(store, sealer)
 	namespaceService := service.NewNamespaceService(store)
-	handler := api.NewHandler(secretService, tokenService, namespaceService, store, sealer)
+	k8sService := service.NewK8sMappingService(store)
+	userService := service.NewUserService(store)
+	auditLogger := audit.NewLogger(store)
+	handler := api.NewHandler(secretService, tokenService, namespaceService, store, sealer, auditLogger)
+	k8sHandler := api.NewK8sHandler(k8sService, auditLogger)
+	userHandler := api.NewUserHandler(userService, auditLogger)
+	auditHandler := api.NewAuditHandler(store)
 
 	// PUBLIC
 	public := http.NewServeMux()
 	public.HandleFunc("/unseal", handler.Unseal)
 	public.HandleFunc("/status", handler.Status)
+	public.HandleFunc("/user/login", userHandler.Login)
 	public.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -158,7 +180,17 @@ func Start() {
 	protected.HandleFunc("/secret/version", handler.GetSecretVersion)
 	protected.HandleFunc("/secret/history", handler.ListSecretVersions)
 	protected.HandleFunc("/secret/all", handler.GetAllSecrets)
+	protected.HandleFunc("/secret/ttl", handler.SetSecretTTL)
+	protected.HandleFunc("/secret/meta", handler.ListSecretMeta)
 	protected.HandleFunc("/stats", handler.GetStats)
+	protected.HandleFunc("/k8s/mappings", k8sHandler.ListMappings)
+	protected.HandleFunc("/k8s/mapping/create", k8sHandler.CreateMapping)
+	protected.HandleFunc("/k8s/mapping/delete", k8sHandler.DeleteMapping)
+	protected.HandleFunc("/k8s/mapping/status", k8sHandler.UpdateStatus)
+	protected.HandleFunc("/audit/events", auditHandler.ListEvents)
+	protected.HandleFunc("/user/create", userHandler.Create)
+	protected.HandleFunc("/user/list", userHandler.List)
+	protected.HandleFunc("/user/delete", userHandler.Delete)
 
 	// APPLY MIDDLEWARE
 	secured := middleware.AuthMiddleware(store)(protected)
@@ -167,9 +199,51 @@ func Start() {
 	finalMux.Handle("/unseal", public)
 	finalMux.Handle("/status", public)
 	finalMux.Handle("/health", public)
+	finalMux.Handle("/user/login", public)
 	finalMux.Handle("/ui/", http.StripPrefix("/ui", ui.Handler()))
 	finalMux.Handle("/", secured)
 
+	go startTTLScheduler(secretService, store, auditLogger, sealer)
+
 	printBanner(dbPath)
 	log.Fatal(http.ListenAndServe(":"+port, finalMux))
+}
+
+func startTTLScheduler(svc *service.SecretService, store storage.Store, al *audit.Logger, sealer *seal.Manager) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		if sealer.IsSealed() {
+			continue
+		}
+		expired, err := store.ListExpiredSecrets()
+		if err != nil || len(expired) == 0 {
+			continue
+		}
+		for _, fullKey := range expired {
+			parts := strings.SplitN(fullKey, "/", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			ns, key := parts[0], parts[1]
+			_, rotErr := svc.Rotate(ns, key)
+			status := audit.StatusSuccess
+			msg := ""
+			if rotErr != nil {
+				status = audit.StatusFailure
+				msg = rotErr.Error()
+			}
+			al.Log(audit.Event{
+				ID:        fmt.Sprintf("%020d", time.Now().UnixNano()),
+				Timestamp: time.Now().Format(time.RFC3339),
+				Type:      audit.TypeSecretRotate,
+				Actor:     "rune-scheduler",
+				ActorID:   "system",
+				Resource:  fullKey,
+				Status:    status,
+				Message:   msg,
+				IP:        "127.0.0.1",
+			})
+		}
+	}
 }
