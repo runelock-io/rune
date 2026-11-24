@@ -1,3 +1,3 @@
 package cli
 
-var Version = "v1.0.0-RC"
+var Version = "v1.0.1-RC"

@@ -1,4 +1,4 @@
-VERSION := v1.0.0-RC
+VERSION := v1.0.1-RC
 LDFLAGS := -ldflags="-s -w -X rune/internal/cli.Version=$(VERSION)"
 BIN     := bin
 
