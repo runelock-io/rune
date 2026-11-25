@@ -117,6 +117,126 @@ Rune ships two binaries that work together:
 - **`rune`** — the CLI client that communicates with the server over HTTP
 - **Web UI** — a React + Tailwind dashboard embedded in the server binary, accessible in any browser
 
+### Full System Workflow
+
+```mermaid
+flowchart TD
+    classDef client  fill:#3b82f6,stroke:#1d4ed8,color:#fff,font-weight:bold
+    classDef pub     fill:#64748b,stroke:#475569,color:#fff
+    classDef crypto  fill:#f59e0b,stroke:#b45309,color:#000,font-weight:bold
+    classDef svc     fill:#7c3aed,stroke:#5b21b6,color:#fff
+    classDef db      fill:#059669,stroke:#047857,color:#fff,font-weight:bold
+    classDef k8s     fill:#0284c7,stroke:#0369a1,color:#fff,font-weight:bold
+    classDef env     fill:#dc2626,stroke:#b91c1c,color:#fff,font-weight:bold
+    classDef mw      fill:#475569,stroke:#334155,color:#fff
+
+    %% ── CLIENTS ──────────────────────────────────────────────
+    subgraph CL["  Clients  "]
+        direction LR
+        CLI["rune CLI"]:::client
+        WUI["Web UI  /ui/"]:::client
+        OPR["rune-operator"]:::client
+        SDK["SDK / CI\nsystem token  stk_"]:::client
+    end
+
+    %% ── SERVER ───────────────────────────────────────────────
+    subgraph SRV["  rune-server  :2710  "]
+
+        subgraph PUB["  Public Endpoints  (no auth)  "]
+            direction LR
+            E1["/unseal"]:::pub
+            E2["/user/login"]:::pub
+            E3["/status  ·  /health"]:::pub
+        end
+
+        subgraph AMW["  Auth Middleware  (every protected request)  "]
+            direction LR
+            M1["extract\nBearer token"]:::mw
+            M2["SHA-256\nhash"]:::mw
+            M3["BoltDB\nlookup"]:::mw
+            M4["namespace\npermission check"]:::mw
+            M1 --> M2 --> M3 --> M4
+        end
+
+        subgraph CRY["  Crypto Layer  "]
+            ARG["Argon2id\nKey Derivation"]:::crypto
+            SEL["Seal Manager\nAES key · memory only\nzeroed on seal"]:::crypto
+            AES["AES-256-GCM\nEncrypt / Decrypt"]:::crypto
+            ARG -->|"derived key"| SEL
+            SEL -->|"active key"| AES
+        end
+
+        subgraph SVC["  Services  "]
+            direction LR
+            SS["SecretService"]:::svc
+            TS["TokenService"]:::svc
+            US["UserService\nbcrypt"]:::svc
+            KS["K8sMappingService"]:::svc
+            AL["AuditLogger"]:::svc
+        end
+
+    end
+
+    %% ── BOLTDB ───────────────────────────────────────────────
+    subgraph BDB["  BoltDB   ~/.rune/rune.db  "]
+        direction LR
+        BS[("Secrets\nns/key → ciphertext")]:::db
+        BT[("Tokens\nSHA-256 → TokenRecord")]:::db
+        BU[("Users\nbcrypt + session token")]:::db
+        BK[("K8s Mappings")]:::db
+        BA[("Audit Events")]:::db
+        BL[("Salt + Verify Key")]:::db
+    end
+
+    %% ── KUBERNETES ───────────────────────────────────────────
+    subgraph K8S["  Kubernetes Cluster  "]
+        direction LR
+        KSC["Kubernetes Secrets"]:::k8s
+        KPD["App Pods\nenvFrom · volumeMount"]:::k8s
+        KSC --> KPD
+    end
+
+    %% ── AUTO-UNSEAL ──────────────────────────────────────────
+    EV["RUNE_UNSEAL_PASSPHRASE\nenv var · injected at startup"]:::env
+
+    %% ── FLOWS ────────────────────────────────────────────────
+
+    %% ① Client → public endpoints
+    CLI & WUI -->|"① passphrase"| E1
+    CLI & WUI -->|"② username + password"| E2
+    CLI & WUI & OPR & SDK -->|"③ Bearer token"| AMW
+
+    %% ② Unseal flow: passphrase → Argon2id → key → Seal Manager → AES
+    E1 -->|"passphrase"| ARG
+    EV  -->|"passphrase on startup"| ARG
+    BL  -->|"stored salt"| ARG
+
+    %% ③ Login flow: username → bcrypt verify → session token
+    E2  --> US
+    US  <-->|"bcrypt verify"| BU
+    US  -.->|"returns session token"| CLI
+
+    %% ④ Auth → Services → Crypto / Storage
+    M4  --> SVC
+    SS  --> AES
+    AES <-->|"encrypt on write\ndecrypt on read"| BS
+    TS  <--> BT
+    KS  <--> BK
+    AL  --> BA
+
+    %% ⑤ Operator sync: fetch from Rune → write to Kubernetes
+    OPR -->|"⑤ GET /k8s/mappings\nGET /secret/all"| AMW
+    OPR -->|"writes synced secrets"| KSC
+```
+
+| Flow | Description |
+|---|---|
+| **① Unseal** | Passphrase → Argon2id (with stored salt) → AES-256 key → held in Seal Manager in memory. Sealing zeros the key instantly — no restart needed. |
+| **② Login** | Username + password → bcrypt verify against `__rune_users` → session token returned. Token flows through existing auth middleware on every subsequent request. |
+| **③ Auth** | Every protected request: extract Bearer token → SHA-256 hash → BoltDB lookup → namespace permission check. Never stores raw tokens. |
+| **④ Secret I/O** | Write: plaintext → AES-256-GCM (unique nonce) → ciphertext stored in BoltDB. Read: ciphertext → decrypt with in-memory key → plaintext. All reads/writes are audit-logged. |
+| **⑤ K8s Sync** | `rune-operator` authenticates with a token, fetches mappings + secrets from Rune, then writes native Kubernetes Secrets in the target namespace. Runs on a configurable interval per mapping. |
+
 ---
 
 ## Installation
