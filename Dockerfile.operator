@@ -1,3 +1,10 @@
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o rune-operator ./cmd/operator
+
 FROM gcr.io/distroless/static:nonroot
-COPY bin/rune-operator /rune-operator
+COPY --from=builder /app/rune-operator /rune-operator
 ENTRYPOINT ["/rune-operator"]

@@ -36,17 +36,6 @@ subjects:
     namespace: rune-system
 
 ---
-apiVersion: v1
-kind: Secret
-metadata:
-  name: rune-operator-credentials
-  namespace: rune-system
-type: Opaque
-stringData:
-  RUNE_SERVER: "http://host.docker.internal:2710"
-  RUNE_TOKEN: "f0d1522eb38a5dffd5e3162a072b5dbc852b01dd7b182419e4073e0ab602309a" # replace with a valid Rune token
-
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -65,10 +54,11 @@ spec:
         app: rune-operator
     spec:
       serviceAccountName: rune-operator
+      terminationGracePeriodSeconds: 30
       containers:
         - name: rune-operator
-          image: rune-operator:dev
-          imagePullPolicy: Never
+          image: ghcr.io/runelock-io/rune-operator:latest
+          imagePullPolicy: IfNotPresent
           env:
             - name: RUNE_SERVER
               valueFrom:
@@ -81,7 +71,7 @@ spec:
                   name: rune-operator-credentials
                   key: RUNE_TOKEN
             - name: SYNC_INTERVAL
-              value: "30s"
+              value: "60s"
           resources:
             requests:
               cpu: "50m"
@@ -89,3 +79,14 @@ spec:
             limits:
               cpu: "200m"
               memory: "128Mi"
+          livenessProbe:
+            exec:
+              command: ["cat", "/tmp/rune-operator-healthy"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["cat", "/tmp/rune-operator-healthy"]
+            initialDelaySeconds: 5
+            periodSeconds: 10

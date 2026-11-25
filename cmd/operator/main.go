@@ -8,7 +8,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -46,8 +50,16 @@ type MappingWithStatus struct {
 var (
 	runeServer   = mustEnv("RUNE_SERVER")
 	runeToken    = mustEnv("RUNE_TOKEN")
-	syncInterval = envOrDefault("SYNC_INTERVAL", "30s")
+	syncInterval = envOrDefault("SYNC_INTERVAL", "60s")
+
+	httpClient = &http.Client{Timeout: 30 * time.Second}
+
+	// tracks when each mapping was last synced, for per-mapping refresh_interval
+	lastSyncMu sync.Mutex
+	lastSync   = map[string]time.Time{}
 )
+
+const healthFile = "/tmp/rune-operator-healthy"
 
 func mustEnv(key string) string {
 	v := os.Getenv(key)
@@ -72,21 +84,44 @@ func main() {
 
 	k8sClient := buildK8sClient()
 
+	// Write health file so liveness/readiness probes pass
+	if err := os.WriteFile(healthFile, []byte("ok"), 0644); err != nil {
+		log.Printf("warning: could not write health file: %v", err)
+	}
+
 	log.Printf("rune-operator started  server=%s  interval=%s", runeServer, interval)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Graceful shutdown on SIGTERM / SIGINT
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigs
+		log.Printf("received %s — shutting down after current sync", sig)
+		os.Remove(healthFile)
+		cancel()
+	}()
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// run immediately on start
-	syncAll(k8sClient)
+	// Run immediately on start
+	syncAll(ctx, k8sClient)
 
-	for range ticker.C {
-		syncAll(k8sClient)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("rune-operator stopped")
+			return
+		case <-ticker.C:
+			syncAll(ctx, k8sClient)
+		}
 	}
 }
 
 func buildK8sClient() *kubernetes.Clientset {
-	// Try in-cluster first, fall back to kubeconfig for local development
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		kubeconfig := os.Getenv("KUBECONFIG")
@@ -107,44 +142,79 @@ func buildK8sClient() *kubernetes.Clientset {
 	return cs
 }
 
-func syncAll(cs *kubernetes.Clientset) {
-	mappings, err := fetchMappings()
+func syncAll(ctx context.Context, cs *kubernetes.Clientset) {
+	mappings, err := fetchMappings(ctx)
 	if err != nil {
 		log.Printf("error fetching mappings: %v", err)
 		return
 	}
 	for _, m := range mappings {
-		syncOne(cs, m.Mapping)
+		if ctx.Err() != nil {
+			return
+		}
+		if !isDue(m.Mapping) {
+			continue
+		}
+		syncOne(ctx, cs, m.Mapping)
 	}
 }
 
-func fetchMappings() ([]MappingWithStatus, error) {
-	req, _ := http.NewRequest("GET", runeServer+"/k8s/mappings", nil)
+// isDue returns true if the mapping is due for a sync based on its own refresh_interval.
+// Falls back to always syncing if the interval is unset or unparseable.
+func isDue(m Mapping) bool {
+	if m.RefreshInterval == "" {
+		return true
+	}
+	d, err := time.ParseDuration(m.RefreshInterval)
+	if err != nil {
+		return true
+	}
+	lastSyncMu.Lock()
+	t := lastSync[m.ID]
+	lastSyncMu.Unlock()
+	return time.Since(t) >= d
+}
+
+func markSynced(id string) {
+	lastSyncMu.Lock()
+	lastSync[id] = time.Now()
+	lastSyncMu.Unlock()
+}
+
+func fetchMappings(ctx context.Context) ([]MappingWithStatus, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", runeServer+"/k8s/mappings", nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Authorization", "Bearer "+runeToken)
-	resp, err := http.DefaultClient.Do(req)
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, body)
 	}
+
 	var list []MappingWithStatus
-	json.NewDecoder(resp.Body).Decode(&list)
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("decode mappings: %w", err)
+	}
 	return list, nil
 }
 
-func syncOne(cs *kubernetes.Clientset, m Mapping) {
+func syncOne(ctx context.Context, cs *kubernetes.Clientset, m Mapping) {
 	start := time.Now()
 
-	secrets, err := fetchRuneSecrets(m)
+	secrets, err := fetchRuneSecrets(ctx, m)
 	if err != nil {
-		reportStatus(m.ID, "error", fmt.Sprintf("fetch failed: %v", err), 0)
+		reportStatus(ctx, m.ID, "error", fmt.Sprintf("fetch failed: %v", err), 0)
 		return
 	}
 
-	// Apply key filter if specified
 	if len(m.Keys) > 0 {
 		filtered := map[string]string{}
 		for _, k := range m.Keys {
@@ -165,7 +235,6 @@ func syncOne(cs *kubernetes.Clientset, m Mapping) {
 		secretType = corev1.SecretTypeOpaque
 	}
 
-	ctx := context.Background()
 	existing, err := cs.CoreV1().Secrets(m.TargetK8sNS).Get(ctx, m.TargetSecret, metav1.GetOptions{})
 
 	if apierrors.IsNotFound(err) {
@@ -185,33 +254,42 @@ func syncOne(cs *kubernetes.Clientset, m Mapping) {
 	}
 
 	if err != nil {
-		reportStatus(m.ID, "error", fmt.Sprintf("k8s apply failed: %v", err), 0)
+		reportStatus(ctx, m.ID, "error", fmt.Sprintf("k8s apply failed: %v", err), 0)
 		return
 	}
 
+	markSynced(m.ID)
 	log.Printf("synced mapping %q (%s/%s) — %d keys in %s", m.Name, m.TargetK8sNS, m.TargetSecret, len(data), time.Since(start).Round(time.Millisecond))
-	reportStatus(m.ID, "synced", "", len(data))
+	reportStatus(ctx, m.ID, "synced", "", len(data))
 }
 
-func fetchRuneSecrets(m Mapping) (map[string]string, error) {
-	url := fmt.Sprintf("%s/secret/all?namespace=%s", runeServer, m.RuneNamespace)
-	req, _ := http.NewRequest("GET", url, nil)
+func fetchRuneSecrets(ctx context.Context, m Mapping) (map[string]string, error) {
+	endpoint := fmt.Sprintf("%s/secret/all?namespace=%s", runeServer, url.QueryEscape(m.RuneNamespace))
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Authorization", "Bearer "+runeToken)
-	resp, err := http.DefaultClient.Do(req)
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, body)
 	}
+
 	var result map[string]string
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode secrets: %w", err)
+	}
 	return result, nil
 }
 
-func reportStatus(mappingID, status, message string, count int) {
+func reportStatus(ctx context.Context, mappingID, status, message string, count int) {
 	payload := SyncStatus{
 		MappingID:   mappingID,
 		LastSync:    time.Now().Format(time.RFC3339),
@@ -220,10 +298,13 @@ func reportStatus(mappingID, status, message string, count int) {
 		SecretCount: count,
 	}
 	data, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", runeServer+"/k8s/mapping/status", bytes.NewBuffer(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", runeServer+"/k8s/mapping/status", bytes.NewBuffer(data))
+	if err != nil {
+		return
+	}
 	req.Header.Set("Authorization", "Bearer "+runeToken)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("failed to report status for %s: %v", mappingID, err)
 		return
