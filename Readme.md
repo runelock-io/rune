@@ -29,6 +29,7 @@
 - [Getting Started](#getting-started)
 - [Multi-Developer Auth](#multi-developer-auth)
 - [Kubernetes Operator](#kubernetes-operator)
+- [Operator Deployment Guide — Kind & EKS](#operator-deployment-guide--kind--eks)
 - [Deploying on AWS EC2](#deploying-on-aws-ec2)
 - [CLI Reference](#cli-reference)
 - [API Reference](#api-reference)
@@ -408,6 +409,691 @@ RUNE_TOKEN=<root-or-system-token> \
 ```
 
 For production, run it as a Kubernetes Deployment with the token stored in a Kubernetes Secret.
+
+---
+
+## Operator Deployment Guide — Kind & EKS
+
+This guide walks through deploying `rune-operator` end-to-end — first on a local **Kind** cluster for development and testing, then on a production **EKS** cluster.
+
+The operator image is hosted publicly at `ghcr.io/runelock-io/rune-operator:latest` — no registry authentication is needed to pull it.
+
+---
+
+### Part 1 — Kind (Local Development)
+
+Kind runs a full Kubernetes cluster inside Docker containers on your laptop. It is the fastest way to test the operator without any cloud account.
+
+#### Prerequisites
+
+```bash
+# macOS
+brew install kind kubectl
+
+# Linux
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
+chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+
+# Verify
+kind --version
+kubectl version --client
+```
+
+You also need Docker running and a Rune server reachable from inside the Kind cluster. The easiest setup is to run `rune-server` on your Mac/Linux host and expose it to Kind containers via your host's gateway IP.
+
+---
+
+#### Step 1 — Create a Kind cluster
+
+```bash
+kind create cluster --name rune-dev
+```
+
+Confirm kubectl is pointing at it:
+
+```bash
+kubectl cluster-info --context kind-rune-dev
+```
+
+Expected output:
+
+```
+Kubernetes control plane is running at https://127.0.0.1:<port>
+```
+
+---
+
+#### Step 2 — Start and configure Rune
+
+If you do not already have a running Rune server, start one locally:
+
+```bash
+rune-server
+# → first-launch wizard: set passphrase, copy root token
+rune unseal
+rune login rnk_<your-root-token>
+```
+
+Create a namespace and add some secrets that will be synced:
+
+```bash
+rune namespace create production
+
+rune put db/password "super-secret-db-pass" -n production
+rune put db/host "postgres.internal:5432" -n production
+rune put api/key "sk_live_abc123def456" -n production
+```
+
+Verify the secrets are there:
+
+```bash
+rune list -n production
+```
+
+---
+
+#### Step 3 — Determine the Rune server URL for Kind
+
+Kind containers cannot reach `localhost` on your host machine. Use your host's Docker bridge IP instead:
+
+```bash
+# macOS — use host.docker.internal (Kind supports it natively)
+RUNE_URL="http://host.docker.internal:2710"
+
+# Linux — find the bridge IP
+docker network inspect kind | grep Gateway
+# example output: "Gateway": "172.18.0.1"
+RUNE_URL="http://172.18.0.1:2710"
+```
+
+Verify the URL is reachable from inside Kind by running a quick curl from a pod:
+
+```bash
+kubectl run curl-test --image=curlimages/curl --rm -it --restart=Never -- \
+  curl -s http://host.docker.internal:2710/status
+# → {"sealed":false}
+```
+
+If you see `{"sealed":false}`, the operator will be able to reach your Rune server.
+
+---
+
+#### Step 4 — Create the operator credentials Secret
+
+The operator needs two values: the Rune server URL and a root (or system) token.
+
+Copy the example manifest and fill it in:
+
+```bash
+cp config/operator/secret.example.yaml config/operator/secret.yaml
+```
+
+Edit `config/operator/secret.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rune-operator-credentials
+  namespace: rune-system
+type: Opaque
+stringData:
+  RUNE_SERVER: "http://host.docker.internal:2710"   # or your Linux bridge IP
+  RUNE_TOKEN: "rnk_<your-root-token>"
+```
+
+> **Never commit `secret.yaml`.** It is listed in `.gitignore` for this reason.
+
+Apply it:
+
+```bash
+kubectl apply -f config/operator/secret.yaml
+```
+
+---
+
+#### Step 5 — Deploy the operator
+
+Apply the full deployment manifest (Namespace, ServiceAccount, RBAC, Deployment):
+
+```bash
+kubectl apply -f config/operator/deploy.yaml
+```
+
+Watch the pod come up:
+
+```bash
+kubectl rollout status deployment/rune-operator -n rune-system
+```
+
+Expected output:
+
+```
+deployment "rune-operator" successfully rolled out
+```
+
+Check the logs to confirm it connected and synced:
+
+```bash
+kubectl logs -n rune-system -l app=rune-operator -f
+```
+
+Expected log lines:
+
+```
+rune-operator started  server=http://host.docker.internal:2710  interval=60s
+synced mapping "prod-db-creds" (default/prod-secrets) — 3 keys in 142ms
+```
+
+---
+
+#### Step 6 — Create a mapping
+
+A mapping tells the operator which Rune namespace to read from and which Kubernetes Secret to write to.
+
+**Via the Rune UI:**
+
+1. Open `http://localhost:2710/ui/`
+2. Navigate to **Kubernetes** in the sidebar
+3. Click **Add Mapping**
+4. Fill in the fields:
+   - **Name**: `prod-db-creds`
+   - **Rune Namespace**: `production`
+   - **Keys**: `db/password`, `db/host`, `api/key` (leave empty to sync all keys)
+   - **Target K8s Secret**: `prod-secrets`
+   - **Target K8s Namespace**: `default`
+   - **Secret Type**: `Opaque`
+   - **Refresh Interval**: `1m`
+
+**Via API:**
+
+```bash
+curl -X POST http://localhost:2710/k8s/mapping/create \
+  -H "Authorization: Bearer rnk_<your-root-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":             "prod-db-creds",
+    "rune_namespace":   "production",
+    "keys":             ["db/password", "db/host", "api/key"],
+    "target_secret":    "prod-secrets",
+    "target_k8s_ns":    "default",
+    "secret_type":      "Opaque",
+    "refresh_interval": "1m"
+  }'
+```
+
+The operator picks up new mappings on its next sync cycle (within 60 seconds, or instantly on startup).
+
+---
+
+#### Step 7 — Verify the Kubernetes Secret was created
+
+```bash
+kubectl get secret prod-secrets -n default
+```
+
+```
+NAME           TYPE     DATA   AGE
+prod-secrets   Opaque   3      12s
+```
+
+Inspect the values (they are base64-encoded — that is standard Kubernetes behaviour):
+
+```bash
+kubectl get secret prod-secrets -n default -o jsonpath='{.data}' | jq
+```
+
+```json
+{
+  "api/key":     "c2tfbGl2ZV9hYmMxMjNkZWY0NTY=",
+  "db/host":     "cG9zdGdyZXMuaW50ZXJuYWw6NTQzMg==",
+  "db/password": "c3VwZXItc2VjcmV0LWRiLXBhc3M="
+}
+```
+
+Decode a value to confirm it matches what you stored in Rune:
+
+```bash
+kubectl get secret prod-secrets -n default \
+  -o jsonpath='{.data.db/password}' | base64 -d
+# → super-secret-db-pass
+```
+
+---
+
+#### Step 8 — Test live sync
+
+Update a secret in Rune and watch the K8s Secret update automatically:
+
+```bash
+rune put db/password "new-rotated-password" -n production
+```
+
+Wait up to 1 minute (the mapping's `refresh_interval`), then check:
+
+```bash
+kubectl get secret prod-secrets -n default \
+  -o jsonpath='{.data.db/password}' | base64 -d
+# → new-rotated-password
+```
+
+---
+
+#### Step 9 — Use the Secret in a Pod
+
+Mount `prod-secrets` as environment variables in any workload:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+        - name: my-app
+          image: my-app:latest
+          envFrom:
+            - secretRef:
+                name: prod-secrets
+```
+
+Or mount individual keys:
+
+```yaml
+env:
+  - name: DB_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: prod-secrets
+        key: db/password
+  - name: API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: prod-secrets
+        key: api/key
+```
+
+---
+
+#### Cleanup
+
+```bash
+kind delete cluster --name rune-dev
+```
+
+---
+
+### Part 2 — EKS (Production)
+
+This section covers deploying `rune-operator` on an existing EKS cluster, pointing at a Rune server running on EC2 (see [Deploying on AWS EC2](#deploying-on-aws-ec2)).
+
+#### Prerequisites
+
+- AWS CLI configured: `aws configure`
+- `kubectl` with EKS context: `aws eks update-kubeconfig --name <cluster-name> --region <region>`
+- A running Rune server on EC2 (or another host reachable from the cluster)
+- A Rune root or system token
+
+---
+
+#### Step 1 — Connect kubectl to your EKS cluster
+
+```bash
+aws eks update-kubeconfig \
+  --name my-cluster \
+  --region us-east-1
+
+# Verify
+kubectl get nodes
+```
+
+Expected output (nodes will vary):
+
+```
+NAME                           STATUS   ROLES    AGE   VERSION
+ip-10-0-1-100.ec2.internal     Ready    <none>   2d    v1.30.0
+ip-10-0-2-200.ec2.internal     Ready    <none>   2d    v1.30.0
+```
+
+---
+
+#### Step 2 — Confirm the operator image is reachable
+
+The image is hosted publicly on GitHub Container Registry. EKS nodes pull from the internet by default — no additional credentials are required.
+
+```bash
+# Optional: verify the image exists and is pullable
+docker pull ghcr.io/runelock-io/rune-operator:latest
+```
+
+If your EKS nodes are in a private subnet without internet access, you will need to either:
+- Mirror the image to ECR (see Step 2a below), or
+- Configure a NAT Gateway for the node subnet
+
+**Step 2a — Optional: Mirror to ECR (private clusters)**
+
+```bash
+AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+AWS_REGION=us-east-1
+ECR_REPO=$AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/rune-operator
+
+# Create ECR repository
+aws ecr create-repository --repository-name rune-operator --region $AWS_REGION
+
+# Pull, tag, push
+aws ecr get-login-password --region $AWS_REGION | \
+  docker login --username AWS --password-stdin $AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com
+
+docker pull ghcr.io/runelock-io/rune-operator:latest
+docker tag ghcr.io/runelock-io/rune-operator:latest $ECR_REPO:latest
+docker push $ECR_REPO:latest
+```
+
+Then update `config/operator/deploy.yaml` to use your ECR URI:
+
+```yaml
+image: <aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/rune-operator:latest
+```
+
+---
+
+#### Step 3 — Ensure EKS nodes can reach the Rune server
+
+The operator pods need outbound HTTP access to your Rune server. If Rune is running on EC2:
+
+1. Open the **EC2 Security Group** attached to your Rune instance to allow inbound traffic on port `2710` from the EKS node security group (not from `0.0.0.0/0`):
+
+```
+Inbound rule:
+  Type:   Custom TCP
+  Port:   2710
+  Source: <EKS node security group ID>   ← e.g. sg-0abc12345def
+```
+
+2. Find the EKS node security group:
+
+```bash
+aws eks describe-cluster --name my-cluster --region us-east-1 \
+  --query "cluster.resourcesVpcConfig.clusterSecurityGroupId" \
+  --output text
+```
+
+3. Test connectivity from inside the cluster:
+
+```bash
+kubectl run curl-test --image=curlimages/curl --rm -it --restart=Never -- \
+  curl -s http://<ec2-private-ip>:2710/status
+# → {"sealed":false}
+```
+
+> Use the **private IP** of the EC2 instance when both the instance and EKS cluster are in the same VPC. This keeps traffic on the internal network and avoids data transfer costs.
+
+---
+
+#### Step 4 — Create the credentials Secret
+
+Retrieve your Rune root or system token, then create the Kubernetes Secret:
+
+```bash
+# Using kubectl directly (avoids writing the token to a file)
+kubectl create namespace rune-system
+
+kubectl create secret generic rune-operator-credentials \
+  --namespace rune-system \
+  --from-literal=RUNE_SERVER="http://<ec2-private-ip>:2710" \
+  --from-literal=RUNE_TOKEN="rnk_<your-token>"
+```
+
+Or use the example manifest:
+
+```bash
+cp config/operator/secret.example.yaml config/operator/secret.yaml
+# Edit secret.yaml, then:
+kubectl apply -f config/operator/secret.yaml
+```
+
+Verify the secret exists:
+
+```bash
+kubectl get secret rune-operator-credentials -n rune-system
+```
+
+---
+
+#### Step 5 — Deploy the operator
+
+```bash
+kubectl apply -f config/operator/deploy.yaml
+```
+
+This creates the following resources in your cluster:
+
+| Resource | Name | Namespace |
+|---|---|---|
+| Namespace | `rune-system` | — |
+| ServiceAccount | `rune-operator` | `rune-system` |
+| ClusterRole | `rune-operator` | — |
+| ClusterRoleBinding | `rune-operator` | — |
+| Deployment | `rune-operator` | `rune-system` |
+
+Wait for the rollout to complete:
+
+```bash
+kubectl rollout status deployment/rune-operator -n rune-system --timeout=120s
+```
+
+---
+
+#### Step 6 — Verify the operator is running
+
+Check the pod is in `Running` state:
+
+```bash
+kubectl get pods -n rune-system
+```
+
+```
+NAME                             READY   STATUS    RESTARTS   AGE
+rune-operator-7d8b9f6c4-xk2pq   1/1     Running   0          45s
+```
+
+Tail the logs to confirm it connected to Rune and synced successfully:
+
+```bash
+kubectl logs -n rune-system -l app=rune-operator --follow
+```
+
+```
+rune-operator started  server=http://10.0.1.50:2710  interval=60s
+synced mapping "prod-db-creds" (backend/app-secrets) — 5 keys in 89ms
+```
+
+If you see an error like `connection refused` or `no route to host`, re-check the security group rules from Step 3.
+
+---
+
+#### Step 7 — Create a Rune namespace and add secrets
+
+On your Rune server (SSH into EC2 or use `rune --server http://<ec2-ip>:2710`):
+
+```bash
+rune namespace create production
+
+rune put db/password  "prod-db-pass-xyz"       -n production
+rune put db/host      "rds.us-east-1.amazonaws.com:5432" -n production
+rune put db/name      "myapp_production"        -n production
+rune put api/secret   "sk_live_prod_abc123"     -n production
+rune put jwt/secret   "jwt-signing-secret-prod" -n production
+```
+
+---
+
+#### Step 8 — Create a mapping
+
+**Via API (from your local machine):**
+
+```bash
+curl -X POST http://<ec2-public-ip>:2710/k8s/mapping/create \
+  -H "Authorization: Bearer rnk_<your-root-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":             "prod-db-creds",
+    "rune_namespace":   "production",
+    "keys":             ["db/password", "db/host", "db/name", "api/secret", "jwt/secret"],
+    "target_secret":    "app-secrets",
+    "target_k8s_ns":    "backend",
+    "secret_type":      "Opaque",
+    "refresh_interval": "5m"
+  }'
+```
+
+> Setting `keys` to an empty array (`[]`) syncs all secrets in the namespace into the Kubernetes Secret.
+
+**Via the UI:**
+
+Open `http://<ec2-public-ip>:2710/ui/` → **Kubernetes** → **Add Mapping**.
+
+---
+
+#### Step 9 — Verify the Kubernetes Secret
+
+Create the target namespace if it does not exist:
+
+```bash
+kubectl create namespace backend
+```
+
+After the next sync cycle (at most 5 minutes, or restart the operator pod to force immediate sync):
+
+```bash
+kubectl get secret app-secrets -n backend
+```
+
+```
+NAME          TYPE     DATA   AGE
+app-secrets   Opaque   5      38s
+```
+
+Decode and verify values:
+
+```bash
+kubectl get secret app-secrets -n backend \
+  -o jsonpath='{.data.db/password}' | base64 -d
+# → prod-db-pass-xyz
+```
+
+Force an immediate sync by restarting the operator (safe — it re-reads all mappings on startup):
+
+```bash
+kubectl rollout restart deployment/rune-operator -n rune-system
+kubectl logs -n rune-system -l app=rune-operator --follow
+```
+
+---
+
+#### Step 10 — Use the Secret in your EKS workloads
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-api
+  namespace: backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: backend-api
+  template:
+    metadata:
+      labels:
+        app: backend-api
+    spec:
+      containers:
+        - name: backend-api
+          image: myorg/backend-api:latest
+          envFrom:
+            - secretRef:
+                name: app-secrets   # all Rune keys injected as env vars
+          ports:
+            - containerPort: 8080
+```
+
+Apply it:
+
+```bash
+kubectl apply -f backend-deployment.yaml
+kubectl rollout status deployment/backend-api -n backend
+```
+
+---
+
+#### Step 11 — Monitoring and debugging
+
+**Check the liveness probe:**
+
+The operator writes `/tmp/rune-operator-healthy` on startup. Kubernetes checks this file every 30 seconds. If the pod is in `CrashLoopBackOff`, the probe failed.
+
+```bash
+kubectl describe pod -n rune-system -l app=rune-operator
+# Look for: Liveness probe failed: cat /tmp/rune-operator-healthy
+```
+
+**View sync status via the Rune API:**
+
+```bash
+curl http://<ec2-ip>:2710/k8s/mappings \
+  -H "Authorization: Bearer rnk_<your-token>" | jq '.[].sync_status'
+```
+
+```json
+{
+  "mapping_id": "abc-123",
+  "last_sync": "2025-11-25T14:32:00Z",
+  "status": "synced",
+  "secret_count": 5
+}
+```
+
+**Common error causes:**
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `connection refused` in logs | Security group blocking port 2710 | Add inbound rule for EKS node SG |
+| `401 Unauthorized` in logs | Token is wrong or revoked | Re-create the credentials Secret |
+| `sealed vault` error in logs | Rune server restarted without auto-unseal | Set `RUNE_UNSEAL_PASSPHRASE` on the server |
+| `404 Not Found` for `/secret/all` | Rune namespace does not exist | Create it with `rune namespace create <name>` |
+| Pod stuck in `Pending` | Image pull failure (private cluster) | Mirror image to ECR (see Step 2a) |
+
+**Stream live operator logs:**
+
+```bash
+kubectl logs -n rune-system -l app=rune-operator --follow --tail=50
+```
+
+---
+
+#### Production hardening checklist for EKS
+
+| | Recommendation |
+|---|---|
+| **Dedicated token** | Create a system token scoped to only the namespaces the operator needs to read — do not use the root token in production |
+| **Namespace scoping** | The operator's ClusterRole grants access to Secrets cluster-wide. Restrict it to specific namespaces with a Role + RoleBinding per namespace if your workloads are namespace-isolated |
+| **Secret rotation** | The `rune-operator-credentials` Secret holds the token. Rotate it via `kubectl create secret --dry-run=client -o yaml \| kubectl apply -f -` |
+| **TLS** | Put Rune behind a TLS-terminating load balancer or Nginx. Update `RUNE_SERVER` to use `https://` |
+| **Resource limits** | The default `deploy.yaml` sets 50m CPU / 32Mi memory requests and 200m / 128Mi limits — tune to your mapping count |
+| **Multiple mappings** | Use `refresh_interval` per mapping to stagger sync cycles (e.g. `2m` for high-churn secrets, `1h` for stable ones) |
+| **Audit log** | Every sync that reads from Rune generates audit events. Review them in the **Audit** view to confirm the operator is behaving as expected |
 
 ---
 
