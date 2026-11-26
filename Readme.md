@@ -519,16 +519,39 @@ curl http://localhost:2710/k8s/mapping/status \
 
 Sync status is also visible in the **Kubernetes** view in the web UI, showing `synced`, `pending`, or `error` per mapping.
 
-### Running the operator
+### Deploying the operator
+
+**Quickest path — one interactive script:**
 
 ```bash
-# Point it at your Rune server
-RUNE_SERVER=http://localhost:2710 \
-RUNE_TOKEN=<root-or-system-token> \
-./rune-operator
+bash config/operator/setup.sh
 ```
 
-For production, run it as a Kubernetes Deployment with the token stored in a Kubernetes Secret.
+It prompts for your Rune server URL and token, creates the `rune-system` namespace, stores the credentials as a Kubernetes Secret, deploys the operator, and waits for the rollout to complete.
+
+**Manual — one command:**
+
+```bash
+kubectl create namespace rune-system
+
+kubectl create secret generic rune-operator-credentials \
+  --namespace rune-system \
+  --from-literal=RUNE_SERVER="http://<your-rune-server>:2710" \
+  --from-literal=RUNE_TOKEN="rnk_<your-token>"
+
+kubectl apply -f config/operator/deploy.yaml
+```
+
+**Using the example manifest:**
+
+```bash
+# Copy, fill in your values, then apply both files together
+cp config/operator/secret.example.yaml config/operator/secret.yaml
+# Edit secret.yaml — replace <your-rune-server> and rnk_<your-token>
+kubectl apply -f config/operator/secret.yaml -f config/operator/deploy.yaml
+```
+
+> `secret.example.yaml` includes the `rune-system` Namespace resource so you can apply it in any order without getting a "namespace not found" error. Never commit `secret.yaml`.
 
 ---
 
@@ -638,45 +661,25 @@ If you see `{"sealed":false}`, the operator will be able to reach your Rune serv
 
 ---
 
-#### Step 4 — Create the operator credentials Secret
+#### Step 4 — Deploy the operator
 
-The operator needs two values: the Rune server URL and a root (or system) token.
-
-Copy the example manifest and fill it in:
+The setup script handles everything — namespace, credentials secret, and deployment in one go:
 
 ```bash
-cp config/operator/secret.example.yaml config/operator/secret.yaml
+bash config/operator/setup.sh
+# → prompts for Rune server URL and token, then deploys
 ```
 
-Edit `config/operator/secret.yaml`:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: rune-operator-credentials
-  namespace: rune-system
-type: Opaque
-stringData:
-  RUNE_SERVER: "http://host.docker.internal:2710"   # or your Linux bridge IP
-  RUNE_TOKEN: "rnk_<your-root-token>"
-```
-
-> **Never commit `secret.yaml`.** It is listed in `.gitignore` for this reason.
-
-Apply it:
+Or manually in one command:
 
 ```bash
-kubectl apply -f config/operator/secret.yaml
-```
+kubectl create namespace rune-system
 
----
+kubectl create secret generic rune-operator-credentials \
+  --namespace rune-system \
+  --from-literal=RUNE_SERVER="http://host.docker.internal:2710" \
+  --from-literal=RUNE_TOKEN="rnk_<your-root-token>"
 
-#### Step 5 — Deploy the operator
-
-Apply the full deployment manifest (Namespace, ServiceAccount, RBAC, Deployment):
-
-```bash
 kubectl apply -f config/operator/deploy.yaml
 ```
 
@@ -960,40 +963,32 @@ kubectl run curl-test --image=curlimages/curl --rm -it --restart=Never -- \
 
 ---
 
-#### Step 4 — Create the credentials Secret
+#### Step 4 — Deploy the operator
 
-Retrieve your Rune root or system token, then create the Kubernetes Secret:
+The setup script handles namespace creation, credentials, and deployment in one shot:
 
 ```bash
-# Using kubectl directly (avoids writing the token to a file)
+bash config/operator/setup.sh
+# → prompts for Rune server URL and token, then deploys
+```
+
+Or manually:
+
+```bash
 kubectl create namespace rune-system
 
 kubectl create secret generic rune-operator-credentials \
   --namespace rune-system \
   --from-literal=RUNE_SERVER="http://<ec2-private-ip>:2710" \
   --from-literal=RUNE_TOKEN="rnk_<your-token>"
+
+kubectl apply -f config/operator/deploy.yaml
 ```
 
-Or use the example manifest:
-
-```bash
-cp config/operator/secret.example.yaml config/operator/secret.yaml
-# Edit secret.yaml, then:
-kubectl apply -f config/operator/secret.yaml
-```
-
-Verify the secret exists:
+Verify the secret and deployment:
 
 ```bash
 kubectl get secret rune-operator-credentials -n rune-system
-```
-
----
-
-#### Step 5 — Deploy the operator
-
-```bash
-kubectl apply -f config/operator/deploy.yaml
 ```
 
 This creates the following resources in your cluster:
