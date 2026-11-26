@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -225,9 +226,11 @@ func syncOne(ctx context.Context, cs *kubernetes.Clientset, m Mapping) {
 		secrets = filtered
 	}
 
+	// Kubernetes Secret keys must match [-._a-zA-Z0-9]+
+	// Replace "/" with "_" so "db/password" becomes "db_password"
 	data := make(map[string][]byte, len(secrets))
 	for k, v := range secrets {
-		data[k] = []byte(v)
+		data[strings.ReplaceAll(k, "/", "_")] = []byte(v)
 	}
 
 	secretType := corev1.SecretType(m.SecretType)
