@@ -502,11 +502,13 @@ curl -X POST http://localhost:2710/k8s/mapping/create \
 |---|---|
 | `name` | Human-readable name for the mapping |
 | `rune_namespace` | The Rune namespace to read secrets from |
-| `keys` | List of secret keys to sync (e.g. `db/password`) |
+| `keys` | List of secret keys to sync — leave empty to sync all keys in the namespace |
 | `target_secret` | Name of the Kubernetes Secret to create/update |
 | `target_k8s_ns` | Kubernetes namespace where the Secret lives |
 | `secret_type` | Kubernetes Secret type — `Opaque`, `kubernetes.io/tls`, etc. |
 | `refresh_interval` | How often the operator re-syncs (e.g. `1m`, `5m`, `1h`) |
+
+> **Key name transformation:** Kubernetes Secret keys only allow `[-._a-zA-Z0-9]+`. The operator automatically replaces `/` with `_` when writing keys, so `db/password` becomes `db_password` and `api/key` becomes `api_key` inside the Kubernetes Secret. Keep this in mind when referencing keys in your Pod specs.
 
 ### Checking sync status
 
@@ -768,17 +770,19 @@ kubectl get secret prod-secrets -n default -o jsonpath='{.data}' | jq
 
 ```json
 {
-  "api/key":     "c2tfbGl2ZV9hYmMxMjNkZWY0NTY=",
-  "db/host":     "cG9zdGdyZXMuaW50ZXJuYWw6NTQzMg==",
-  "db/password": "c3VwZXItc2VjcmV0LWRiLXBhc3M="
+  "api_key":     "c2tfbGl2ZV9hYmMxMjNkZWY0NTY=",
+  "db_host":     "cG9zdGdyZXMuaW50ZXJuYWw6NTQzMg==",
+  "db_password": "c3VwZXItc2VjcmV0LWRiLXBhc3M="
 }
 ```
+
+> Keys with `/` are automatically renamed: `db/password` → `db_password`, `api/key` → `api_key`.
 
 Decode a value to confirm it matches what you stored in Rune:
 
 ```bash
 kubectl get secret prod-secrets -n default \
-  -o jsonpath='{.data.db/password}' | base64 -d
+  -o jsonpath='{.data.db_password}' | base64 -d
 # → super-secret-db-pass
 ```
 
@@ -796,7 +800,7 @@ Wait up to 1 minute (the mapping's `refresh_interval`), then check:
 
 ```bash
 kubectl get secret prod-secrets -n default \
-  -o jsonpath='{.data.db/password}' | base64 -d
+  -o jsonpath='{.data.db_password}' | base64 -d
 # → new-rotated-password
 ```
 
@@ -838,12 +842,12 @@ env:
     valueFrom:
       secretKeyRef:
         name: prod-secrets
-        key: db/password
+        key: db_password   # Rune key "db/password" → "db_password" in K8s
   - name: API_KEY
     valueFrom:
       secretKeyRef:
         name: prod-secrets
-        key: api/key
+        key: api_key       # Rune key "api/key" → "api_key" in K8s
 ```
 
 ---
@@ -1103,7 +1107,7 @@ Decode and verify values:
 
 ```bash
 kubectl get secret app-secrets -n backend \
-  -o jsonpath='{.data.db/password}' | base64 -d
+  -o jsonpath='{.data.db_password}' | base64 -d
 # → prod-db-pass-xyz
 ```
 
